@@ -16,11 +16,20 @@ class Settings(BaseSettings):
     ENABLE_DB_CREATE: bool = True
     LOG_LEVEL: str = "INFO"
 
-    DB_USER: str
-    DB_PASSWORD: str
-    DB_SERVER: str
-    DB_PORT: str
-    DB_NAME: str
+    # DB_USER: str
+    # DB_PASSWORD: str
+    # DB_SERVER: str
+     # DB_NAME: str
+    DB_SERVER: str = "localhost"
+    DB_PORT: str = "3306"
+    DB_NAME: str = "pms"
+    DB_USER: str = "root"
+    DB_PASSWORD: str = "Santhi@2003"
+
+
+    OLLAMA_URL: str = "http://127.0.0.1:11434/api/chat"
+    OLLAMA_MODEL: str = "llama3.2:3b"
+
     DB_ECHO: bool = Field(default=False)
     DB_POOL_SIZE: int = 30
     DB_MAX_OVERFLOW: int = 60
@@ -41,7 +50,8 @@ class Settings(BaseSettings):
         encoded_password = quote_plus(self.DB_PASSWORD)
         return f"mysql+aiomysql://{self.DB_USER}:{encoded_password}@{self.DB_SERVER}:{self.DB_PORT}/{self.DB_NAME}"
 
-    SECRET_KEY: str
+    #SECRET_KEY: str
+    SECRET_KEY: str="Pp1Qicmjlt_1GH3s5M02dfyEQfJm7gsLBreNwntn01Y"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
