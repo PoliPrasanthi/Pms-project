@@ -28,3 +28,4 @@ api_router.include_router(search.router,        prefix="/search",         tags=[
 api_router.include_router(audit.router,         prefix="/audit",          tags=["audit"])
 api_router.include_router(external_timesheet.router, prefix="/external-timesheet", tags=["external-timesheet"])
 api_router.include_router(chatbot.router, prefix="/chatbot", tags=["chatbot"])
+

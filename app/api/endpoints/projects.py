@@ -43,6 +43,14 @@ from app.services.template_cloning_service import TemplateCloningService
 
 router = APIRouter(dependencies=[Depends(allow_authenticated)])
 
+# can create is for chatbot project creation access checking
+@router.get("/can-create")
+async def can_create_project(
+    current_user=Depends(allow_proj_create),
+):
+    return {
+        "can_create": True
+    }
 
 @router.post("/", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
 async def create_project_endpoint(

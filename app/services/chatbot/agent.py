@@ -26,52 +26,105 @@ async def run_agent(
             "content": user_message,
         },
     ]
-    response = await chat_with_nvidia(messages=messages,tools=TOOLS,)
 
+    response = await chat_with_nvidia(
+        messages=messages,
+        tools=TOOLS,
+    )
 
-    message = response.get("choices",[{}])[0].get("message",{})
+    message = response.get(
+        "choices",
+        [{}]
+    )[0].get(
+        "message",
+        {}
+    )
 
-    tool_calls = message.get("tool_calls",[])
+    tool_calls = message.get(
+        "tool_calls",
+        []
+    )
 
     if not tool_calls:
-
+        print("No tool calls found in the response.")
         return {
-            "response": message.get( "content","")
+            "response": message.get(
+                "content",
+                ""
+            )
         }
-
     messages.append(message)
+
     for tool_call in tool_calls:
 
-        function = tool_call.get("function",{})
+        function = tool_call.get(
+            "function",
+            {}
+        )
 
-        tool_name = function.get("name")
+        tool_name = function.get(
+            "name"
+        )
 
-        tool_function = TOOL_FUNCTIONS.get(tool_name)
+        arguments = function.get(
+            "arguments",
+            {}
+        )
 
-        if tool_function:
+        if isinstance(arguments, str):
 
-            result = await tool_function(
-                access_token
-            )
+            try:
+                arguments = json.loads(arguments)
 
-        else:
+            except json.JSONDecodeError:
+                arguments = {}
+
+        tool_function = TOOL_FUNCTIONS.get(
+            tool_name
+        )
+
+        if not tool_function:
 
             result = {
                 "error": f"Unknown tool: {tool_name}"
             }
+
+        else:
+            result = await tool_function(
+                access_token,
+                arguments
+            )
+        print(f"\nTOOL {tool_call}:")
+        print(f"NAME      : {tool_name}")
+        print(f"ARGUMENTS : {arguments}")
+
         messages.append(
             {
                 "role": "tool",
-                "content": json.dumps(result),
-                "tool_call_id": tool_call.get("id"),
+                "content": json.dumps(
+                    result,
+                    default=str
+                ),
+                "tool_call_id": tool_call.get(
+                    "id"
+                ),
             }
         )
+
     final_response = await chat_with_nvidia(
         messages=messages,
     )
 
-    final_message = final_response.get("choices",[{}])[0].get("message",{})
-
+    final_message = final_response.get(
+        "choices",
+        [{}]
+    )[0].get(
+        "message",
+        {}
+    )
     return {
-        "response": final_message.get("content","")
+        "response": final_message.get(
+            "content",
+            ""
+        ) or ""
     }
