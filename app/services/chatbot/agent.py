@@ -1,7 +1,12 @@
 import json
 
-from app.services.chatbot.tools.prompt import SYSTEM_PROMPT
+from app.services.chatbot.tools.prompt import (
+    SYSTEM_PROMPT,
+    FINAL_SYSTEM_PROMPT,
+)
+
 from app.services.chatbot.nvidia_client import chat_with_nvidia
+
 from app.services.chatbot.tools import (
     PROJECT_TOOLS,
     TOOL_FUNCTIONS,
@@ -27,92 +32,108 @@ async def run_agent(
         },
     ]
 
-    response = await chat_with_nvidia(
-        messages=messages,
-        tools=TOOLS,
-    )
+    while True:
 
-    message = response.get(
-        "choices",
-        [{}]
-    )[0].get(
-        "message",
-        {}
-    )
+        response = await chat_with_nvidia(
+            messages=messages,
+            tools=TOOLS,
+        )
 
-    tool_calls = message.get(
-        "tool_calls",
-        []
-    )
-
-    if not tool_calls:
-        print("No tool calls found in the response.")
-        return {
-            "response": message.get(
-                "content",
-                ""
-            )
-        }
-    messages.append(message)
-
-    for tool_call in tool_calls:
-
-        function = tool_call.get(
-            "function",
+        message = response.get(
+            "choices",
+            [{}]
+        )[0].get(
+            "message",
             {}
         )
 
-        tool_name = function.get(
-            "name"
+        tool_calls = message.get(
+            "tool_calls",
+            []
         )
 
-        arguments = function.get(
-            "arguments",
-            {}
-        )
-
-        if isinstance(arguments, str):
-
-            try:
-                arguments = json.loads(arguments)
-
-            except json.JSONDecodeError:
-                arguments = {}
-
-        tool_function = TOOL_FUNCTIONS.get(
-            tool_name
-        )
-
-        if not tool_function:
-
-            result = {
-                "error": f"Unknown tool: {tool_name}"
-            }
-
-        else:
-            result = await tool_function(
-                access_token,
-                arguments
-            )
-        print(f"\nTOOL {tool_call}:")
-        print(f"NAME      : {tool_name}")
-        print(f"ARGUMENTS : {arguments}")
+        if not tool_calls:
+            break
 
         messages.append(
-            {
-                "role": "tool",
-                "content": json.dumps(
-                    result,
-                    default=str
-                ),
-                "tool_call_id": tool_call.get(
-                    "id"
-                ),
-            }
+            message
+        )
+
+        for tool_call in tool_calls:
+
+            function = tool_call.get(
+                "function",
+                {}
+            )
+
+            tool_name = function.get(
+                "name"
+            )
+
+            arguments = function.get(
+                "arguments",
+                {}
+            )
+
+            if isinstance(arguments, str):
+
+                try:
+                    arguments = json.loads(
+                        arguments
+                    )
+
+                except json.JSONDecodeError:
+                    arguments = {}
+
+            tool_function = TOOL_FUNCTIONS.get(
+                tool_name
+            )
+
+            if not tool_function:
+
+                result = {
+                    "error": f"Unknown tool: {tool_name}"
+                }
+
+            else:
+
+                result = await tool_function(
+                    access_token,
+                    arguments
+                )
+
+            messages.append(
+                {
+                    "role": "tool",
+                    "content": json.dumps(
+                        result,
+                        default=str
+                    ),
+                    "tool_call_id": tool_call.get(
+                        "id"
+                    ),
+                }
+            )
+
+    final_messages = [
+        {
+            "role": "system",
+            "content": FINAL_SYSTEM_PROMPT,
+        },
+        {
+            "role": "user",
+            "content": user_message,
+        },
+    ]
+
+    for message in messages[2:]:
+        final_messages.append(
+            message
         )
 
     final_response = await chat_with_nvidia(
-        messages=messages,
+        messages=final_messages,
+        json_mode=True,
     )
 
     final_message = final_response.get(
@@ -122,9 +143,80 @@ async def run_agent(
         "message",
         {}
     )
-    return {
-        "response": final_message.get(
-            "content",
+
+    content = final_message.get(
+        "content",
+        ""
+    ) or ""
+
+    try:
+
+        result = json.loads(
+            content
+        )
+
+        if not isinstance(result, dict):
+
+            return {
+                "response": content,
+                "data": {}
+            }
+
+        response_value = result.get(
+            "response",
             ""
-        ) or ""
-    }
+        )
+
+        data_value = result.get(
+            "data",
+            {}
+        )
+
+        if isinstance(
+            response_value,
+            str
+        ):
+
+            nested_content = response_value.strip()
+
+            if (
+                nested_content.startswith("{")
+                and
+                nested_content.endswith("}")
+            ):
+
+                try:
+
+                    nested_result = json.loads(
+                        nested_content
+                    )
+
+                    if isinstance(
+                        nested_result,
+                        dict
+                    ):
+
+                        response_value = nested_result.get(
+                            "response",
+                            response_value
+                        )
+
+                        data_value = nested_result.get(
+                            "data",
+                            data_value
+                        )
+
+                except json.JSONDecodeError:
+                    pass
+
+        return {
+            "response": response_value,
+            "data": data_value
+        }
+
+    except json.JSONDecodeError:
+
+        return {
+            "response": content,
+            "data": {}
+        }

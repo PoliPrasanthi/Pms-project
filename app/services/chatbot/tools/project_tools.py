@@ -85,10 +85,7 @@ async def get_my_issues(access_token: str,arguments: dict = None):
 
         return response.json()
 
-async def check_create_project_permission(
-    access_token: str,
-    arguments: dict = None
-):
+async def check_create_project_permission(access_token: str,arguments: dict = None):
     headers = {
         "Authorization": f"Bearer {access_token}"
     }
@@ -126,10 +123,7 @@ async def check_create_project_permission(
     }
 
 
-async def get_my_milestones(
-    access_token: str,
-    arguments: dict = None
-):
+async def get_my_milestones(access_token: str,arguments: dict = None):
     headers = {
         "Authorization": f"Bearer {access_token}"
     }
@@ -145,6 +139,7 @@ async def get_my_milestones(
         response.raise_for_status()
 
         return response.json()
+    
     
 async def get_my_timelogs(access_token: str,arguments: dict = None):
     headers = {
