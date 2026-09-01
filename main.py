@@ -38,6 +38,10 @@ from app.models.audit import AuditFieldsMapping, AuditLogs, AuditLogDetails, Aud
 from app.models.master import MasterLookup
 from app.models.timesheet import Timesheet
 from fastapi.staticfiles import StaticFiles
+from app.services.chatbot.mongodb import (
+    initialize_chat_database,
+    close_chat_database,
+)
 
 if not os.path.exists("uploads"):
     os.makedirs("uploads")
@@ -47,9 +51,17 @@ IS_PRODUCTION = os.getenv("ENVIRONMENT", "development").lower() == "production"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+
     await cache.connect()
+
+    await initialize_chat_database()
+
     yield
+
     await cache.close()
+
+    await close_chat_database()
+
     engine.dispose()
 
 app = FastAPI(

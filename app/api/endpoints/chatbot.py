@@ -1,14 +1,20 @@
 from fastapi import APIRouter, Depends, Request
 
 from app.core.security import get_current_user
-from app.schemas.chatbot import ChatRequest
+from app.schemas.chatbot import (
+    ChatRequest,
+    ChatResponse,
+)
 from app.services.chatbot.agent import run_agent
 
 
 router = APIRouter()
 
 
-@router.post("/chat")
+@router.post(
+    "/chat",
+    response_model=ChatResponse,
+)
 async def chat(
     request: Request,
     chat_request: ChatRequest,
@@ -16,7 +22,7 @@ async def chat(
 ):
     access_token = request.headers.get(
         "Authorization",
-        ""
+        "",
     )
 
     if access_token.startswith("Bearer "):
@@ -25,4 +31,5 @@ async def chat(
     return await run_agent(
         user_message=chat_request.message,
         access_token=access_token,
+        user_id=current_user.id,
     )

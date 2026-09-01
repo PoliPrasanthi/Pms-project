@@ -27,7 +27,8 @@ class Settings(BaseSettings):
     NVIDIA_MODEL: str
     NVIDIA_API_KEY: str
 
-   
+    MONGODB_URL: str
+    MONGODB_DATABASE: str
 
     DB_ECHO: bool = Field(default=False)
     DB_POOL_SIZE: int = 30
