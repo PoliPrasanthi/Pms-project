@@ -1,16 +1,16 @@
 from .project_tools import (
-    get_my_milestones,
     get_my_projects,
     get_my_tasks,
     get_my_tasklists,
     get_my_issues,
-    check_create_project_permission,
+    get_my_milestones,
     get_my_timelogs,
+    create_task,
+    create_project,
 )
 
 
 PROJECT_TOOLS = [
-
     {
         "type": "function",
         "function": {
@@ -25,7 +25,6 @@ PROJECT_TOOLS = [
             },
         },
     },
-
     {
         "type": "function",
         "function": {
@@ -40,7 +39,6 @@ PROJECT_TOOLS = [
             },
         },
     },
-
     {
         "type": "function",
         "function": {
@@ -55,7 +53,6 @@ PROJECT_TOOLS = [
             },
         },
     },
-
     {
         "type": "function",
         "function": {
@@ -70,27 +67,14 @@ PROJECT_TOOLS = [
             },
         },
     },
-
-    {
-        "type": "function",
-        "function": {
-            "name": "check_create_project_permission",
-            "description": (
-                "Check whether the currently authenticated "
-                "user has permission to create a project. "
-                "Use this before creating a project."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {},
-            },
-        },
-    },
     {
         "type": "function",
         "function": {
             "name": "get_my_milestones",
-            "description": "Get the milestones accessible to the current user.",
+            "description": (
+                "Get the milestones accessible to "
+                "the currently authenticated user."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -111,20 +95,66 @@ PROJECT_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "start_creation",
+            "description": (
+                "Start a creation workflow for the requested PMS entity. "
+                "Use entity_type='project' for project creation and "
+                "entity_type='task' for task creation. "
+                "Extract only values explicitly provided by the user. "
+                "Do not create anything."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entity_type": {
+                        "type": "string",
+                        "enum": [
+                            "task",
+                            "project",
+                            "issue",
+                            "milestone",
+                            "tasklist",
+                        ],
+                    },
+                    "arguments": {
+                        "type": "object",
+                        "additionalProperties": True,
+                    },
+                },
+                "required": [
+                    "entity_type",
+                    "arguments",
+                ],
+            },
+        },
+    },
 ]
 
 
+READ_TOOLS = {
+    "get_my_projects",
+    "get_my_tasks",
+    "get_my_tasklists",
+    "get_my_issues",
+    "get_my_milestones",
+    "get_my_timelogs",
+}
+
+CREATION_INTENT_TOOLS = {
+    "start_creation",
+}
+
+
 TOOL_FUNCTIONS = {
-
     "get_my_projects": get_my_projects,
-
     "get_my_tasks": get_my_tasks,
-
     "get_my_tasklists": get_my_tasklists,
-
     "get_my_issues": get_my_issues,
-
-    "check_create_project_permission": check_create_project_permission,
     "get_my_milestones": get_my_milestones,
     "get_my_timelogs": get_my_timelogs,
+    "create_task": create_task,
+    "create_project": create_project,
 }

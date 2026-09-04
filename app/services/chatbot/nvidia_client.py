@@ -1,4 +1,3 @@
-import time
 import httpx
 
 from app.core.config import settings
@@ -8,6 +7,7 @@ async def chat_with_nvidia(
     messages: list,
     tools: list | None = None,
     json_mode: bool = False,
+    tool_choice: dict | str | None = None,
 ):
     payload = {
         "model": settings.NVIDIA_MODEL,
@@ -21,6 +21,9 @@ async def chat_with_nvidia(
     if tools:
         payload["tools"] = tools
         payload["parallel_tool_calls"] = True
+
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
 
     if json_mode:
         payload["response_format"] = {

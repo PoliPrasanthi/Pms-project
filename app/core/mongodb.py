@@ -22,3 +22,6 @@ chat_history_collection = mongo_db[
 chat_counters_collection = mongo_db[
     "chat_counters"
 ]
+pending_operations_collection = mongo_db[
+    "pending_operations"
+]
