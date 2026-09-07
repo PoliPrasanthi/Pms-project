@@ -19,10 +19,12 @@ PMS_MODULE_URL = {
 REQUIRED_TASK_FIELDS = [
     "task_name",
     "project_id",
-
     "due_date",
 ]
-
+REQUIRED_TASKLIST_FIELDS = [
+    "name",
+    "project_id",
+]
 REQUIRED_PROJECT_FIELDS = [
     "account_name",
     "project_name",
@@ -38,6 +40,16 @@ REQUIRED_PROJECT_FIELDS = [
     "user_emails"
 ]
 
+REQUIRED_ISSUE_FIELDS = [
+    "bug_name",
+    "project_id",
+    "assignee_id",
+    "start_date",
+    "due_date",
+    "status_id",
+    "severity_id",
+]
+
 DEFAULT_TASK_VALUES = {
     "priority_id": "22",
     "status_id": "16",
@@ -50,10 +62,11 @@ DEFAULT_PROJECT_VALUES = {
     "project_type":"42",
     "billing_model":"43"
 }
-    
-
-
-
+DEFAULT_ISSUE_VALUES = {
+    "status_id":"1",
+    "severity_id":"26",
+    "start_date": datetime.now(timezone.utc).date().isoformat(),
+}
 async def get_my_projects(
     access_token: str,
     arguments: dict | None = None,
@@ -231,13 +244,89 @@ async def create_project(
     }
 
     payload["project_manager_id"] = current_user.id
-    print("Payload for create_project:", payload)
+    
     async with httpx.AsyncClient(
         timeout=60.0
     ) as client:
 
         response = await client.post(
             PMS_BASE_URL + PMS_MODULE_URL["projects"],
+            headers=headers,
+            json=payload,
+        )
+
+        if response.status_code >= 400:
+            return {
+                "success": False,
+                "status_code": response.status_code,
+                "error": response.text,
+            }
+
+        return {
+            "success": True,
+            "status_code": response.status_code,
+            "data": response.json(),
+        }
+
+async def create_issue(
+    access_token,
+    current_user,
+    arguments,
+):
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        key: value
+        for key, value in arguments.items()
+        if value is not None
+    }
+
+    payload["reporter_id"] = current_user.id
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+
+        response = await client.post(
+            PMS_BASE_URL + PMS_MODULE_URL["issues"],
+            headers=headers,
+            json=payload,
+        )
+
+        if response.status_code >= 400:
+            return {
+                "success": False,
+                "status_code": response.status_code,
+                "error": response.text,
+            }
+
+        return {
+            "success": True,
+            "status_code": response.status_code,
+            "data": response.json(),
+        }
+
+async def create_tasklist(
+    access_token,
+    current_user,
+    arguments,
+):
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        key: value
+        for key, value in arguments.items()
+        if value is not None
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+
+        response = await client.post(
+            PMS_BASE_URL + PMS_MODULE_URL["tasklists"],
             headers=headers,
             json=payload,
         )

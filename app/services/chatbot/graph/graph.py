@@ -54,6 +54,9 @@ def detect_creation_entity(message: str) -> str | None:
 
     if "project" in text:
         return "project"
+    
+    if "tasklist" in text:
+        return "tasklist"
 
     if "task" in text:
         return "task"
@@ -320,24 +323,53 @@ async def final_node(
             "",
         )
         or ""
-    )
+    ).strip()
 
     try:
         result = json.loads(content)
 
-        if not isinstance(result, dict):
-            result = {
-                "response_type": "chat",
-                "response": content,
-                "data": {},
-            }
-
     except json.JSONDecodeError:
 
+        start = content.find("{")
+        end = content.rfind("}")
+
+        if start != -1 and end != -1:
+
+            try:
+                result = json.loads(
+                    content[start:end + 1]
+                )
+
+            except json.JSONDecodeError:
+
+                result = {
+                    "response_type": "chat",
+                    "response": (
+                        "<p>I couldn't format "
+                        "the response.</p>"
+                    ),
+                    "data": [],
+                }
+
+        else:
+
+            result = {
+                "response_type": "chat",
+                "response": (
+                    "<p>I couldn't format "
+                    "the response.</p>"
+                ),
+                "data": [],
+            }
+
+    if not isinstance(result, dict):
         result = {
             "response_type": "chat",
-            "response": content,
-            "data": {},
+            "response": (
+                "<p>I couldn't format "
+                "the response.</p>"
+            ),
+            "data": [],
         }
 
     return {

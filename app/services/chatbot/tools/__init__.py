@@ -1,4 +1,5 @@
 from .project_tools import (
+    create_issue,
     get_my_projects,
     get_my_tasks,
     get_my_tasklists,
@@ -112,11 +113,11 @@ PROJECT_TOOLS = [
                     "entity_type": {
                         "type": "string",
                         "enum": [
+                            "tasklist",
                             "task",
                             "project",
                             "issue",
                             "milestone",
-                            "tasklist",
                         ],
                     },
                     "arguments": {
@@ -157,4 +158,5 @@ TOOL_FUNCTIONS = {
     "get_my_timelogs": get_my_timelogs,
     "create_task": create_task,
     "create_project": create_project,
+    "create_issue": create_issue,
 }

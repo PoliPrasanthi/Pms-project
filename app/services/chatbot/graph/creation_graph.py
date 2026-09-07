@@ -16,8 +16,13 @@ from app.services.chatbot.tools.project_tools import (
     REQUIRED_PROJECT_FIELDS,
     DEFAULT_TASK_VALUES,
     DEFAULT_PROJECT_VALUES,
+    DEFAULT_ISSUE_VALUES,
+    REQUIRED_ISSUE_FIELDS,
+    REQUIRED_TASKLIST_FIELDS,
     create_task,
     create_project,
+    create_issue,
+    create_tasklist,
 )
 
 
@@ -52,6 +57,14 @@ CREATION_CONFIG = {
         "required_fields": REQUIRED_PROJECT_FIELDS,
         "name": "project",
     },
+    "issue":{
+        "required_fields": REQUIRED_ISSUE_FIELDS,
+        "name": "issue",
+    },
+    "tasklist": {
+        "required_fields": REQUIRED_TASKLIST_FIELDS,
+        "name": "tasklist",
+    }
 }
 
 
@@ -197,6 +210,24 @@ def merge_data_node(
                 and not current_value.strip()
             ):
                 arguments[key] = value
+    elif entity_type == "issue":
+        if "Start_date" in arguments:
+            arguments["start_date"] = arguments.pop(
+                "Start_date"
+            )
+        for key, value in DEFAULT_ISSUE_VALUES.items():
+            current_value = arguments.get(key)
+
+            if current_value is None or (
+                isinstance(current_value, str)
+                and not current_value.strip()
+            ):
+                arguments[key] = value
+    elif entity_type == "tasklist":
+         #return as there are no default values to merge for tasklist
+        return {
+            "arguments": arguments,
+        }
 
     return {
         "arguments": arguments,
@@ -349,6 +380,21 @@ async def create_node(
     elif entity_type == "project":
 
         result = await create_project(
+            access_token=state["access_token"],
+            current_user=state["current_user"],
+            arguments=arguments,
+        )
+
+    elif entity_type == "issue":
+
+        result = await create_issue(
+            access_token=state["access_token"],
+            current_user=state["current_user"],
+            arguments=arguments,
+        )
+    elif entity_type == "tasklist":
+
+        result = await create_tasklist(
             access_token=state["access_token"],
             current_user=state["current_user"],
             arguments=arguments,
