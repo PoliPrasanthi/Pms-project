@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import uuid
 
 import httpx
 
@@ -6,13 +7,16 @@ import httpx
 PMS_BASE_URL = "http://127.0.0.1:8000/api/v1/"
 
 PMS_MODULE_URL = {
+    "projects_details": "chatbot/projects",
     "projects": "projects/",
+    "task_details":"chatbot/tasks",
     "tasks": "tasks/",
     "tasklists": "tasklists/",
     "issues": "issues/",
     "milestones": "milestones/",
     "timelogs": "timelogs/",
     "permissions": "chatbot/permissions",
+    "chatbot_user": "chatbot/chatbot-user",
 }
 
 
@@ -20,6 +24,12 @@ REQUIRED_TASK_FIELDS = [
     "task_name",
     "project_id",
     "due_date",
+    "estimated_hours",
+    "owner_id",
+    "priority_id",
+    "status_id",
+    "start_date",
+
 ]
 REQUIRED_TASKLIST_FIELDS = [
     "name",
@@ -29,9 +39,10 @@ REQUIRED_PROJECT_FIELDS = [
     "account_name",
     "project_name",
     "customer_name",
-    "project_id_sync",
     "billing_model",
     "project_type",
+    "project_id_sync",
+    "project_manager_id",
     "status_id",
     "priority_id",
     "expected_start_date",
@@ -58,6 +69,7 @@ DEFAULT_TASK_VALUES = {
 DEFAULT_PROJECT_VALUES = {
     "status_id": "9",
     "priority_id": "22",
+    "project_id_sync":str(uuid.uuid4()),
     "expected_start_date": datetime.now(timezone.utc).date().isoformat(),
     "project_type":"42",
     "billing_model":"43"
@@ -67,6 +79,51 @@ DEFAULT_ISSUE_VALUES = {
     "severity_id":"26",
     "start_date": datetime.now(timezone.utc).date().isoformat(),
 }
+
+async def get_current_user_details(
+    access_token: str,
+    arguments: dict | None = None,
+):
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+    }
+
+    async with httpx.AsyncClient(
+        timeout=30.0
+    ) as client:
+
+        response = await client.get(
+            PMS_BASE_URL + PMS_MODULE_URL["chatbot_user"],
+            headers=headers,
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+async def get_my_permissions(
+    access_token: str,
+    arguments: dict | None = None,
+):
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+    }
+
+    async with httpx.AsyncClient(
+        timeout=30.0
+    ) as client:
+
+        response = await client.get(
+            PMS_BASE_URL + PMS_MODULE_URL["permissions"],
+            headers=headers,
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+    
 async def get_my_projects(
     access_token: str,
     arguments: dict | None = None,
@@ -77,7 +134,7 @@ async def get_my_projects(
 
     async with httpx.AsyncClient() as client:
         response = await client.get(
-            PMS_BASE_URL + PMS_MODULE_URL["projects"],
+            PMS_BASE_URL + PMS_MODULE_URL["projects_details"],
             headers=headers,
             timeout=60.0,
         )
@@ -97,7 +154,7 @@ async def get_my_tasks(
 
     async with httpx.AsyncClient() as client:
         response = await client.get(
-            PMS_BASE_URL + PMS_MODULE_URL["tasks"],
+            PMS_BASE_URL + PMS_MODULE_URL["task_details"],
             headers=headers,
             timeout=60.0,
         )
@@ -202,7 +259,7 @@ async def create_task(
         if value is not None
     }
 
-    payload["owner_id"] = current_user.id
+    # payload["owner_id"] = int(arguments.get("owner_id"))
 
     async with httpx.AsyncClient(
         timeout=60.0
@@ -243,7 +300,7 @@ async def create_project(
         if value is not None
     }
 
-    payload["project_manager_id"] = current_user.id
+    # payload["project_manager_id"] = current_user.id
     
     async with httpx.AsyncClient(
         timeout=60.0

@@ -22,8 +22,6 @@ from app.services.chatbot.graph.creation_graph import (
     get_pending_operation,
     delete_pending_operation,
 )
-
-
 PMS_PERMISSIONS_URL = (
     "http://127.0.0.1:8000/api/v1/chatbot/permissions"
 )
@@ -662,7 +660,11 @@ async def run_agent(
             "messages": messages,
             "access_token": access_token,
             "current_user": current_user,
+            "user_id": user_id,
+            "session_id": session_id,
             "permissions": permissions,
+            "action": action,
+            "form_data": form_data,
         }
     )
 
