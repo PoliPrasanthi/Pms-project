@@ -12,6 +12,7 @@ PMS_MODULE_URL = {
     "task_details":"chatbot/tasks",
     "tasks": "tasks/",
     "tasklists": "tasklists/",
+    "tasklists_details": "chatbot/tasklists",
     "issues": "issues/",
     "milestones": "milestones/",
     "timelogs": "timelogs/",
@@ -61,6 +62,10 @@ REQUIRED_ISSUE_FIELDS = [
     "severity_id",
 ]
 
+REQUIRED_MILESTONE_FIELDS = [
+    "milestone_name",
+    "project_id"
+]
 DEFAULT_TASK_VALUES = {
     "priority_id": "22",
     "status_id": "16",
@@ -174,7 +179,7 @@ async def get_my_tasklists(
 
     async with httpx.AsyncClient() as client:
         response = await client.get(
-            PMS_BASE_URL + PMS_MODULE_URL["tasklists"],
+            PMS_BASE_URL + PMS_MODULE_URL["tasklists_details"],
             headers=headers,
             timeout=60.0,
         )
@@ -259,17 +264,24 @@ async def create_task(
         if value is not None
     }
 
-    # payload["owner_id"] = int(arguments.get("owner_id"))
-
     async with httpx.AsyncClient(
         timeout=60.0
     ) as client:
-        print("Payload for create_task:", payload)
+
+        print("\n" + "=" * 60)
+        print("CREATE TASK")
+        print("Payload:", payload)
+        print("=" * 60)
+
         response = await client.post(
             PMS_BASE_URL + PMS_MODULE_URL["tasks"],
             headers=headers,
             json=payload,
         )
+
+        print("STATUS:", response.status_code)
+        print("RESPONSE:", response.text)
+
         if response.status_code >= 400:
             return {
                 "success": False,
@@ -282,7 +294,6 @@ async def create_task(
             "status_code": response.status_code,
             "data": response.json(),
         }
-
 
 async def create_project(
     access_token: str,
@@ -384,6 +395,43 @@ async def create_tasklist(
 
         response = await client.post(
             PMS_BASE_URL + PMS_MODULE_URL["tasklists"],
+            headers=headers,
+            json=payload,
+        )
+
+        if response.status_code >= 400:
+            return {
+                "success": False,
+                "status_code": response.status_code,
+                "error": response.text,
+            }
+
+        return {
+            "success": True,
+            "status_code": response.status_code,
+            "data": response.json(),
+        }
+
+async def create_milestone(
+    access_token: str,
+    current_user,
+    arguments: dict,
+):
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        key: value
+        for key, value in arguments.items()
+        if value is not None
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+
+        response = await client.post(
+            PMS_BASE_URL + PMS_MODULE_URL["milestones"],
             headers=headers,
             json=payload,
         )

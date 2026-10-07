@@ -1,5 +1,7 @@
 from .project_tools import (
     create_issue,
+    create_milestone,
+    create_tasklist,
     get_current_user_details,
     get_my_projects,
     get_my_tasks,
@@ -217,6 +219,8 @@ TOOL_FUNCTIONS = {
     "create_task": create_task,
     "create_project": create_project,
     "create_issue": create_issue,
+    "create_milestone": create_milestone,
+    "create_tasklist": create_tasklist,
     "get_my_permissions": get_my_permissions,
     "get_current_user_details": get_current_user_details, 
 }

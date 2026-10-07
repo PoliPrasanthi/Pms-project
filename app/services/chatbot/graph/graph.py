@@ -17,68 +17,54 @@ from app.services.chatbot.tools import (
     CREATION_INTENT_TOOLS,
 )
 
-
 from app.services.chatbot.graph.creation_graph import (
-        run_creation_graph,
-    )
+    run_creation_graph,
+)
 
-async def has_create_permission(
-    access_token: str,
+
+# ============================================================
+# PERMISSION CHECK
+# ============================================================
+
+def has_create_permission(
+    permissions: dict,
     entity_type: str,
 ) -> bool:
 
-    permission_tool = TOOL_FUNCTIONS.get(
-        "get_my_permissions"
-    )
-
-    if not permission_tool:
+    if not isinstance(permissions, dict):
         return False
 
-    permission_response = await permission_tool(
-        access_token,
-        {},
-    )
+    permission_key_map = {
+        "project": "proj-create",
+        "task": "task-create",
+        "issue": "issue-create",
+        "time": "time-create",
+        "milestone": "milestone-create",
+        "tasklist": "tasklist-create",
+    }
 
-    if not isinstance(
-        permission_response,
-        dict,
-    ):
+    permission_key = permission_key_map.get(entity_type.lower())
+
+    if not permission_key:
         return False
 
-    permissions = permission_response.get(
-        "permissions",
-        {},
-    )
-
-    if not isinstance(
-        permissions,
-        dict,
-    ):
-        return False
-
-    permission_key = (
-        f"{entity_type}-create"
-    )
-
-    permission_value = permissions.get(
-        permission_key
-    )
+    permission_value = permissions.get(permission_key)
 
     if permission_value is True:
         return True
 
-    if isinstance(
-        permission_value,
-        str,
-    ):
+    if isinstance(permission_value, str):
         return permission_value.strip().lower() in {
-            "o",
-            "a",
-            "all",
             "true",
+            "all",
+            "a",
+            "o",
         }
 
     return False
+# ============================================================
+# GREETINGS
+# ============================================================
 
 GREETINGS = {
     "hi",
@@ -96,6 +82,7 @@ GREETINGS = {
 def is_simple_greeting(
     message: str,
 ) -> bool:
+
     normalized = (
         message
         .lower()
@@ -108,14 +95,50 @@ def is_simple_greeting(
     return normalized in GREETINGS
 
 
+# ============================================================
+# DETECT CREATION ENTITY
+# ============================================================
+
+import re
+
+
 def detect_creation_entity(
     message: str,
 ) -> str | None:
+
     text = (
         message
         .lower()
         .strip()
     )
+
+    # ---------------------------------------------------------
+    # Detect the entity immediately after the creation action.
+    # This prevents "project" mentioned as a context from
+    # overriding the actual entity being created.
+    # ---------------------------------------------------------
+
+    pattern = re.search(
+        r"\b(?:create|add|make|insert|new)\s+"
+        r"(?:a\s+|an\s+)?"
+        r"(tasklist|task\s+list|task|project|issue|milestone)\b",
+        text,
+    )
+
+    if pattern:
+        entity = pattern.group(1)
+
+        if entity in {
+            "tasklist",
+            "task list",
+        }:
+            return "tasklist"
+
+        return entity
+
+    # ---------------------------------------------------------
+    # Fallback
+    # ---------------------------------------------------------
 
     if "tasklist" in text:
         return "tasklist"
@@ -123,11 +146,11 @@ def detect_creation_entity(
     if "task list" in text:
         return "tasklist"
 
-    if "project" in text:
-        return "project"
-
     if "task" in text:
         return "task"
+
+    if "project" in text:
+        return "project"
 
     if "issue" in text:
         return "issue"
@@ -137,10 +160,14 @@ def detect_creation_entity(
 
     return None
 
+# ============================================================
+# PERMISSION QUESTION
+# ============================================================
 
 def is_permission_question(
     message: str,
 ) -> bool:
+
     text = (
         message
         .lower()
@@ -170,6 +197,7 @@ def is_permission_question(
         return True
 
     entity_type = detect_creation_entity(text)
+
     if entity_type:
         return (
             "permission" in text
@@ -182,9 +210,106 @@ def is_permission_question(
     return False
 
 
+# ============================================================
+# ACTUAL CREATION REQUEST
+# ============================================================
+
+def detect_read_tools(message: str) -> list[str]:
+    """
+    Determine which read tools are required for a PMS data question.
+
+    This routing is deterministic so normal PMS data questions do not
+    depend on the LLM deciding whether to emit a tool call. The LLM is
+    still used after the tool results are returned to analyze, filter,
+    compare, or sort the actual data.
+    """
+
+    text = (message or "").lower().strip()
+
+    if not text:
+        return []
+
+    tools = []
+
+    def has(patterns: tuple[str, ...]) -> bool:
+        return any(
+            re.search(pattern, text)
+            for pattern in patterns
+        )
+
+    # Task lists must be checked separately so the word "task" inside
+    # "task list" does not accidentally select get_my_tasks.
+    wants_tasklists = has((
+        r"\btask\s*lists?\b",
+        r"\btasklists?\b",
+    ))
+
+    wants_tasks = has((
+        r"\btasks?\b(?!\s*lists?\b)",
+        r"\btask\s+(?:priority|status|owner|owners|assignee|assignees|due|deadline|deadlines)\b",
+        r"\b(?:priority|priorities)\s+(?:of|for|on)\s+(?:my\s+)?tasks?\b",
+    ))
+
+    wants_projects = has((
+        r"\bprojects?\b",
+        r"\bproject\s+(?:status|manager|owner|team|members|priority|details?)\b",
+    ))
+
+    wants_issues = has((
+        r"\bissues?\b",
+        r"\bdefects?\b",
+    ))
+
+    wants_milestones = has((
+        r"\bmilestones?\b",
+    ))
+
+    wants_timelogs = has((
+        r"\btime\s*logs?\b",
+        r"\btimesheets?\b",
+        r"\btime\s*entries\b",
+    ))
+
+    # If a task is explicitly being requested in/under/for a project,
+    # "project" is context for the task rather than a request to fetch
+    # the project list.
+    task_in_project_context = bool(
+        wants_tasks
+        and re.search(
+            r"\btasks?\b.*\b(?:in|under|inside|within|for|of)\b.*\bproject\b",
+            text,
+        )
+    )
+
+    if wants_projects and not task_in_project_context:
+        tools.append("get_my_projects")
+
+    if wants_tasks:
+        tools.append("get_my_tasks")
+
+    if wants_tasklists:
+        tools.append("get_my_tasklists")
+
+    if wants_issues:
+        tools.append("get_my_issues")
+
+    if wants_milestones:
+        tools.append("get_my_milestones")
+
+    if wants_timelogs:
+        tools.append("get_my_timelogs")
+
+    return tools
+
+
+# ============================================================
+# ACTUAL CREATION REQUEST
+# ============================================================
+
 def is_actual_creation_request(
     message: str,
 ) -> bool:
+
     text = (
         message
         .lower()
@@ -216,9 +341,14 @@ def is_actual_creation_request(
     )
 
 
+# ============================================================
+# LLM NODE
+# ============================================================
+
 async def llm_node(
     state: ChatState,
 ):
+
     messages = list(
         state.get("messages", [])
     )
@@ -231,15 +361,25 @@ async def llm_node(
     user_message = ""
 
     for message in reversed(messages):
+
         if message.get("role") == "user":
+
             user_message = (
-                message.get("content", "")
+                message.get(
+                    "content",
+                    "",
+                )
                 or ""
             )
+
             break
 
+    # --------------------------------------------------------
+    # GREETING
+    # --------------------------------------------------------
 
     if is_simple_greeting(user_message):
+
         return {
             "messages": messages,
             "final_response": {
@@ -251,17 +391,24 @@ async def llm_node(
             },
         }
 
+    # --------------------------------------------------------
+    # SESSION PERMISSION CONTEXT
+    # --------------------------------------------------------
 
     permission_context_exists = any(
         message.get("role") == "system"
         and (
             "SESSION PERMISSIONS"
-            in message.get("content", "")
+            in message.get(
+                "content",
+                "",
+            )
         )
         for message in messages
     )
 
     if permissions and not permission_context_exists:
+
         messages.insert(
             0,
             {
@@ -284,13 +431,20 @@ async def llm_node(
             },
         )
 
+    # --------------------------------------------------------
+    # PERMISSION QUESTION
+    # --------------------------------------------------------
 
-    if is_permission_question(user_message):
+    if is_permission_question(
+        user_message
+    ):
+
         entity_type = detect_creation_entity(
             user_message
         )
 
         if entity_type:
+
             entity_labels = {
                 "task": "task",
                 "project": "project",
@@ -304,12 +458,20 @@ async def llm_node(
                 entity_type,
             )
 
-            allowed = await has_create_permission(
-                access_token=state["access_token"],
+            # IMPORTANT:
+            # Use permissions stored in the current session.
+            # Do NOT call get_my_permissions() again.
+
+            allowed = has_create_permission(
+                permissions=state.get(
+                    "permissions",
+                    {},
+                ),
                 entity_type=entity_type,
             )
 
             if allowed:
+
                 return {
                     "messages": messages,
                     "final_response": {
@@ -334,10 +496,14 @@ async def llm_node(
                 },
             }
 
+    # --------------------------------------------------------
+    # ACTUAL CREATION REQUEST
+    # --------------------------------------------------------
 
     if is_actual_creation_request(
         user_message
     ):
+
         entity_type = detect_creation_entity(
             user_message
         )
@@ -360,7 +526,7 @@ async def llm_node(
             "role": "assistant",
             "content": None,
             "tool_calls": [
-                synthetic_tool_call,
+                synthetic_tool_call
             ],
         }
 
@@ -370,6 +536,55 @@ async def llm_node(
             ],
         }
 
+        # --------------------------------------------------------
+    # DETERMINISTIC READ TOOL ROUTING
+    # --------------------------------------------------------
+    #
+    # Normal PMS data questions must reach the backend even when the
+    # LLM does not emit a tool call by itself. Creation handling above
+    # remains unchanged.
+    #
+    # Examples:
+    #   "show my tasks" -> get_my_tasks
+    #   "sort my tasks by priority" -> get_my_tasks
+    #   "show my projects and tasks" -> both tools
+    #
+    # The final LLM still performs the requested analysis/sorting after
+    # the real tool data is returned.
+
+    read_tools = detect_read_tools(user_message)
+
+    if read_tools:
+
+        synthetic_tool_calls = []
+
+        for index, tool_name in enumerate(read_tools):
+            synthetic_tool_calls.append(
+                {
+                    "id": f"read_intent_{index}",
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": "{}",
+                    },
+                }
+            )
+
+        synthetic_message = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": synthetic_tool_calls,
+        }
+
+        return {
+            "messages": messages + [
+                synthetic_message
+            ],
+        }
+
+    # --------------------------------------------------------
+    # NVIDIA
+    # --------------------------------------------------------
 
     response = await chat_with_nvidia(
         messages=messages,
@@ -382,6 +597,7 @@ async def llm_node(
     )
 
     if not choices:
+
         return {
             "messages": messages,
             "final_response": {
@@ -399,13 +615,20 @@ async def llm_node(
     )
 
     return {
-        "messages": messages + [message],
+        "messages": messages + [
+            message
+        ],
     }
 
+
+# ============================================================
+# ROUTE AFTER LLM
+# ============================================================
 
 def route_after_llm(
     state: ChatState,
 ):
+
     if state.get("final_response"):
         return "final"
 
@@ -425,15 +648,21 @@ def route_after_llm(
     return "final"
 
 
+# ============================================================
+# TOOL NODE
+# ============================================================
+
 async def tool_node(
     state: ChatState,
 ):
+
     messages = state.get(
         "messages",
         [],
     )
 
     if not messages:
+
         return {
             "messages": messages,
         }
@@ -463,24 +692,31 @@ async def tool_node(
             {},
         )
 
-
         if isinstance(
             arguments,
             str,
         ):
+
             try:
+
                 arguments = json.loads(
                     arguments
                 )
+
             except json.JSONDecodeError:
+
                 arguments = {}
 
         if not isinstance(
             arguments,
             dict,
         ):
+
             arguments = {}
 
+        # ====================================================
+        # CREATION INTENT
+        # ====================================================
 
         if tool_name in CREATION_INTENT_TOOLS:
 
@@ -497,19 +733,26 @@ async def tool_node(
                 creation_arguments,
                 dict,
             ):
+
                 creation_arguments = {}
 
+            # ------------------------------------------------
+            # FALLBACK ENTITY DETECTION
+            # ------------------------------------------------
 
             if not entity_type:
+
                 user_message = ""
 
                 for message in reversed(
                     messages
                 ):
+
                     if (
                         message.get("role")
                         == "user"
                     ):
+
                         user_message = (
                             message.get(
                                 "content",
@@ -517,14 +760,15 @@ async def tool_node(
                             )
                             or ""
                         )
+
                         break
 
                 entity_type = detect_creation_entity(
                     user_message
                 )
 
-
             if not entity_type:
+
                 return {
                     "messages": messages,
                     "final_response": {
@@ -541,14 +785,27 @@ async def tool_node(
                 entity_type
             ).strip().lower()
 
+            # =================================================
+            # IMPORTANT PERMISSION CHECK
+            # =================================================
+            #
+            # DO NOT call get_my_permissions() here.
+            #
+            # Use the permissions belonging to the
+            # current user's MongoDB session.
+            #
+            # =================================================
 
-            allowed = await has_create_permission(
-                access_token=state["access_token"],
+            allowed = has_create_permission(
+                permissions=state.get(
+                    "permissions",
+                    {},
+                ),
                 entity_type=entity_type,
             )
 
-        
             if not allowed:
+
                 return {
                     "messages": messages,
                     "final_response": {
@@ -562,6 +819,9 @@ async def tool_node(
                     },
                 }
 
+            # ------------------------------------------------
+            # CURRENT USER
+            # ------------------------------------------------
 
             current_user = state.get(
                 "current_user"
@@ -582,6 +842,7 @@ async def tool_node(
                     dict,
                 )
             ):
+
                 user_id = current_user.get(
                     "id"
                 )
@@ -590,6 +851,7 @@ async def tool_node(
                 user_id is None
                 or session_id is None
             ):
+
                 return {
                     "messages": messages,
                     "final_response": {
@@ -604,6 +866,9 @@ async def tool_node(
                     },
                 }
 
+            # ------------------------------------------------
+            # CREATION GRAPH
+            # ------------------------------------------------
 
             creation_response = (
                 await run_creation_graph(
@@ -624,18 +889,21 @@ async def tool_node(
                 )
             )
 
-
             return {
                 "messages": messages,
                 "final_response": creation_response,
             }
 
+        # ====================================================
+        # NORMAL TOOLS
+        # ====================================================
 
         tool_function = TOOL_FUNCTIONS.get(
             tool_name,
         )
 
         if not tool_function:
+
             result = {
                 "error": (
                     f"Unknown tool: {tool_name}"
@@ -643,19 +911,43 @@ async def tool_node(
             }
 
         elif tool_name in READ_TOOLS:
+
             result = await tool_function(
                 state["access_token"],
                 arguments,
             )
 
-            print("\n" + "=" * 70)
-            print("[GRAPH] TOOL OUTPUT")
-            print("=" * 70)
-            print(f"[GRAPH] Tool: {tool_name}")
-            print(json.dumps(result, indent=2, default=str))
-            print("=" * 70)
+            print(
+                "\n"
+                + "=" * 70
+            )
+
+            print(
+                "[GRAPH] TOOL OUTPUT"
+            )
+
+            print(
+                "=" * 70
+            )
+
+            print(
+                f"[GRAPH] Tool: {tool_name}"
+            )
+
+            print(
+                json.dumps(
+                    result,
+                    indent=2,
+                    default=str,
+                )
+            )
+
+            print(
+                "=" * 70
+            )
 
         else:
+
             result = {
                 "error": (
                     f"Tool {tool_name} is not "
@@ -677,35 +969,52 @@ async def tool_node(
         )
 
     return {
-        "messages": messages + tool_messages,
+        "messages": messages + tool_messages
     }
 
+
+# ============================================================
+# ROUTE AFTER TOOLS
+# ============================================================
 
 def route_after_tools(
     state: ChatState,
 ):
-    if state.get("final_response"):
-        return "final"
 
-    return "llm"
+    # Creation workflows already return their final response.
+    # Normal read tools must go directly to the final node.
+    # Sending them back to llm_node would run deterministic read
+    # routing again and call the same tool repeatedly.
+    return "final"
 
+
+# ============================================================
+# JSON EXTRACTION
+# ============================================================
 
 def extract_json_object(
     content: str,
 ):
+
     if not content:
         return None
 
     cleaned = content.strip()
 
     if cleaned.startswith("```json"):
-        cleaned = cleaned[len("```json"):]
+
+        cleaned = cleaned[
+            len("```json"):
+        ]
 
         if cleaned.endswith("```"):
             cleaned = cleaned[:-3]
 
     elif cleaned.startswith("```"):
-        cleaned = cleaned[len("```"):]
+
+        cleaned = cleaned[
+            len("```"):
+        ]
 
         if cleaned.endswith("```"):
             cleaned = cleaned[:-3]
@@ -713,378 +1022,361 @@ def extract_json_object(
     cleaned = cleaned.strip()
 
     try:
-        return json.loads(cleaned)
+
+        return json.loads(
+            cleaned
+        )
+
     except json.JSONDecodeError:
+
         pass
 
     start = cleaned.find("{")
     end = cleaned.rfind("}")
 
-    if start != -1 and end != -1 and end > start:
+    if (
+        start != -1
+        and end != -1
+        and end > start
+    ):
+
         try:
+
             return json.loads(
-                cleaned[start:end + 1]
+                cleaned[
+                    start:end + 1
+                ]
             )
+
         except json.JSONDecodeError:
+
             pass
 
     return None
 
 
+# ============================================================
+# NORMALIZE FINAL RESPONSE
+# ============================================================
+
 def normalize_final_response(
     result,
 ):
+
     if not isinstance(
         result,
         dict,
     ):
         return None
 
-    result.setdefault(
-        "response_type",
-        "chat",
-    )
-
-    result.setdefault(
+    result["response_type"] = "chat"
+    result["response"] = result.get(
         "response",
         "<p>I couldn't format the response.</p>",
     )
 
-    result.setdefault(
-        "data",
-        [],
-    )
+    # The frontend needs the formatted response. Do not make the LLM
+    # repeat the complete tool payload, which can cause truncation.
+    result["data"] = []
 
     return result
 
 
+# ============================================================
+# HTML VALUE
+# ============================================================
 
-def _html_value(value, level=0):
+def _html_value(
+    value,
+    level=0,
+):
+
     if value is None:
         return ""
 
-    if isinstance(value, bool):
-        return "true" if value else "false"
+    if isinstance(
+        value,
+        bool,
+    ):
 
-    if isinstance(value, (str, int, float)):
-        return html.escape(str(value))
+        return (
+            "true"
+            if value
+            else "false"
+        )
+
+    if isinstance(
+        value,
+        (
+            str,
+            int,
+            float,
+        ),
+    ):
+
+        return html.escape(
+            str(value)
+        )
 
     if level > 6:
-        return html.escape(str(value))
 
-    if isinstance(value, list):
+        return html.escape(
+            str(value)
+        )
+
+    if isinstance(
+        value,
+        list,
+    ):
+
         if not value:
-            return "<p>No records returned.</p>"
 
-        parts = ["<ul>"]
-        for item in value[:100]:
-            parts.append("<li>")
-            parts.append(_html_value(item, level + 1))
-            parts.append("</li>")
-        if len(value) > 100:
-            parts.append(
-                f"<li>Showing first 100 of {len(value)} records.</li>"
+            return (
+                "<p>No records returned.</p>"
             )
-        parts.append("</ul>")
+
+        parts = [
+            "<ul>"
+        ]
+
+        for item in value[:100]:
+
+            parts.append(
+                "<li>"
+            )
+
+            parts.append(
+                _html_value(
+                    item,
+                    level + 1,
+                )
+            )
+
+            parts.append(
+                "</li>"
+            )
+
+        if len(value) > 100:
+
+            parts.append(
+                f"<li>Showing first 100 "
+                f"of {len(value)} records.</li>"
+            )
+
+        parts.append(
+            "</ul>"
+        )
+
         return "".join(parts)
 
-    if isinstance(value, dict):
+    if isinstance(
+        value,
+        dict,
+    ):
+
         if not value:
-            return "<p>No data returned.</p>"
 
-        parts = ["<div>"]
+            return (
+                "<p>No data returned.</p>"
+            )
+
+        parts = [
+            "<div>"
+        ]
+
         for key, item in value.items():
-            label = html.escape(str(key).replace("_", " ").title())
-            parts.append("<div style=\"margin-bottom:6px;\">")
-            parts.append(f"<strong>{label}:</strong> ")
-            if isinstance(item, (dict, list)):
-                parts.append(_html_value(item, level + 1))
+
+            label = html.escape(
+                str(key)
+                .replace(
+                    "_",
+                    " ",
+                )
+                .title()
+            )
+
+            parts.append(
+                '<div style="margin-bottom:6px;">'
+            )
+
+            parts.append(
+                f"<strong>{label}:</strong> "
+            )
+
+            if isinstance(
+                item,
+                (
+                    dict,
+                    list,
+                ),
+            ):
+
+                parts.append(
+                    _html_value(
+                        item,
+                        level + 1,
+                    )
+                )
+
             else:
-                parts.append(_html_value(item, level + 1))
-            parts.append("</div>")
-        parts.append("</div>")
+
+                parts.append(
+                    _html_value(
+                        item,
+                        level + 1,
+                    )
+                )
+
+            parts.append(
+                "</div>"
+            )
+
+        parts.append(
+            "</div>"
+        )
+
         return "".join(parts)
 
-    return html.escape(str(value))
+    return html.escape(
+        str(value)
+    )
 
 
-def build_tool_results_html(messages):
-    tool_name_by_id = {}
+# ============================================================
+# TOOL RESULTS HTML
+# ============================================================
 
-    for message in messages:
-        if message.get("role") != "assistant":
-            continue
+# ============================================================
+# EXTRACT TOOL DATA
+# ============================================================
 
-        for tool_call in message.get("tool_calls", []) or []:
-            tool_id = tool_call.get("id")
-            function = tool_call.get("function", {}) or {}
-            tool_name = function.get("name", "tool")
-            if tool_id:
-                tool_name_by_id[tool_id] = tool_name
+def extract_tool_data(
+    messages
+):
 
-    sections = []
-
-    for message in messages:
-        if message.get("role") != "tool":
-            continue
-
-        raw_content = message.get("content", "") or ""
-        tool_name = tool_name_by_id.get(
-            message.get("tool_call_id"),
-            "PMS Tool",
-        )
-
-        try:
-            parsed = json.loads(raw_content)
-        except (TypeError, json.JSONDecodeError):
-            parsed = raw_content
-
-        sections.append(
-            "<section style=\"margin-bottom:16px;\">"
-            f"<h4>{html.escape(tool_name)}</h4>"
-            f"{_html_value(parsed)}"
-            "</section>"
-        )
-
-    if not sections:
-        return "<p>No PMS tool data was returned.</p>"
-
-    return "".join(sections)
-
-
-def find_current_turn_messages(messages):
-    user_index = -1
-
-    for index in range(len(messages) - 1, -1, -1):
-        if messages[index].get("role") == "user":
-            user_index = index
-            break
-
-    if user_index == -1:
-        return []
-
-    return messages[user_index + 1:]
-
-
-def extract_tool_data(messages):
     data = []
 
     for message in messages:
-        if message.get("role") != "tool":
+
+        if message.get(
+            "role"
+        ) != "tool":
+
             continue
 
         raw_content = (
-            message.get("content", "")
+            message.get(
+                "content",
+                "",
+            )
             or ""
         )
 
         try:
-            parsed = json.loads(raw_content)
-        except (TypeError, json.JSONDecodeError):
+
+            parsed = json.loads(
+                raw_content
+            )
+
+        except (
+            TypeError,
+            json.JSONDecodeError,
+        ):
+
             parsed = raw_content
 
-        data.append(parsed)
+        data.append(
+            parsed
+        )
 
     return data
 
 
-def tool_data_has_records(tool_data):
-    if not isinstance(tool_data, list):
-        return False
+# ============================================================
+# NAVIGATION URLS
+# ============================================================
 
-    def contains_non_empty_list(value):
-        if isinstance(value, list):
-            if value:
-                return True
-            return False
+ENTITY_ROUTES = {
+    "projects": "projects",
+    "project": "projects",
+    "tasks": "tasks",
+    "task": "tasks",
+    "issues": "issues",
+    "issue": "issues",
+    # "tasklists": "tasklists",
+    # "task_lists": "tasklists",
+    # "tasklist": "tasklists",
+    "milestones": "milestones",
+    "milestone": "milestones",
+}
 
-        if isinstance(value, dict):
-            return any(
-                contains_non_empty_list(item)
-                for item in value.values()
+
+def add_navigation_urls(value):
+    """Add frontend links without filtering or rebuilding entity lists."""
+
+    if isinstance(value, list):
+        return [add_navigation_urls(item) for item in value]
+
+    if not isinstance(value, dict):
+        return value
+
+    result = {
+        key: add_navigation_urls(item)
+        for key, item in value.items()
+    }
+
+    for key, route in ENTITY_ROUTES.items():
+        records = result.get(key)
+
+        if isinstance(records, list):
+            for record in records:
+                if isinstance(record, dict) and record.get("id") not in (None, ""):
+                    record.setdefault(
+                        "navigation_url",
+                        f"/{route}/{record['id']}",
+                    )
+
+        elif isinstance(records, dict) and records.get("id") not in (None, ""):
+            records.setdefault(
+                "navigation_url",
+                f"/{route}/{records['id']}",
             )
 
-        return False
+    return result
 
-    return any(
-        contains_non_empty_list(item)
-        for item in tool_data
-    )
-
-
-def is_failed_format_response(result):
-    if not isinstance(result, dict):
-        return True
-
-    response = str(
-        result.get("response", "")
-        or ""
-    ).lower()
-
-    failure_phrases = (
-        "i couldn't format",
-        "i could not format",
-        "couldn't format the response",
-        "could not format the response",
-    )
-
-    return any(
-        phrase in response
-        for phrase in failure_phrases
-    )
+STRICT_FINAL_OUTPUT_CONTRACT = (
+    "FINAL OUTPUT CONTRACT — FOLLOW EXACTLY:\n"
+    "For list queries, return ONE ordered HTML list using <ol> and one <li> per record. "
+    "Preserve TOOL DATA record order unless the user explicitly requests sorting, ranking, filtering, or another ordering. For an explicit ordering request, perform that operation using only TOOL DATA. Do not invent, merge, or duplicate records.\n"
+    "Project list exact order: linked Project Name (Public ID) — Manager: ... — Delivery Head: ... — Status: ... — Priority: ... — Expected: Start Date – End Date — Team: .... "
+    "Display no Id, Description, Billing Type, timestamps, or other fields.\n"
+    "Task list exact order: linked Task Name (Task/Public ID) — Project: ... — Status: ... — Priority: ... — Assignee: ... — Due: ....\n"
+    "Issue list exact order: linked Issue Name (Issue/Public ID) — Project: ... — Status: ... — Priority: ... — Assignee: ... — Due: ....\n"
+    "Milestone list exact order: linked Milestone Name (Milestone/Public ID) — Project: ... — Status: ... — Due: ....\n"
+    "Task List exact order: linked Task List Name — Project: ... — Description: ... when available.\n"
+    "The primary entity name MUST be a clickable HTML <a> using navigation_url. If navigation_url is absent and id exists, use /projects/{id}, /tasks/{id}, /issues/{id}, /tasklists/{id}, or /milestones/{id} according to entity type. Never show the URL as text.\n"
+    "Do not output raw JSON, tool names, internal metadata, or fields outside the applicable format unless explicitly requested."
+)
 
 
-def claims_no_records(result, tool_data):
-    if not isinstance(result, dict):
-        return False
+# ============================================================
+# FALLBACK FORMATTER
+# ============================================================
 
-    if not tool_data_has_records(tool_data):
-        return False
-
-    response = str(
-        result.get("response", "")
-        or ""
-    ).lower()
-
-    no_record_phrases = (
-        "no projects were found",
-        "no projects found",
-        "no tasks were found",
-        "no tasks found",
-        "no issues were found",
-        "no issues found",
-        "no milestones were found",
-        "no milestones found",
-        "no task lists were found",
-        "no task lists found",
-        "no tasklists were found",
-        "no tasklists found",
-        "no records were found",
-        "no records found",
-    )
-
-    return any(
-        phrase in response
-        for phrase in no_record_phrases
-    )
-
-
-async def format_tool_html_with_llm(
-    user_message: str,
-    tool_html: str,
-    tool_data: list,
-    permissions: dict,
-):
-    fallback_messages = [
-        {
-            "role": "system",
-            "content": (
-                "Return ONLY valid JSON with exactly these keys: "
-                "response_type, response, data.\n\n"
-
-                "Set response_type to 'chat'.\n\n"
-
-                "The user asked a PMS data question.\n"
-                "The application has provided the actual PMS "
-                "tool result and a Python-generated HTML "
-                "representation of that result.\n\n"
-
-                "The TOOL DATA is the authoritative source of truth.\n"
-                "The HTML is only a presentation representation.\n\n"
-
-                "Rules:\n"
-                "- Use only values present in TOOL DATA.\n"
-                "- Never invent PMS information.\n"
-                "- Never claim that records do not exist when "
-                "TOOL DATA contains records.\n"
-                "- Only say that no records were found when the "
-                "relevant collection in TOOL DATA is actually empty.\n"
-                "- Decide which fields to display based on the "
-                "user's question.\n"
-                "- You may omit irrelevant fields.\n"
-                "- Do not add fields that are not present in TOOL DATA.\n"
-                "- Keep the response concise and readable.\n"
-                "- Use the Python-generated HTML structure when useful.\n"
-                "- Return valid JSON only.\n\n"
-
-                "TOOL DATA:\n"
-                + json.dumps(
-                    tool_data,
-                    default=str,
-                )
-                + "\n\n"
-
-                "PYTHON-GENERATED HTML:\n"
-                + tool_html
-            ),
-        },
-        {
-            "role": "user",
-            "content": user_message,
-        },
-    ]
-
-    if permissions:
-        fallback_messages.append(
-            {
-                "role": "system",
-                "content": (
-                    "SESSION PERMISSIONS:\n"
-                    + json.dumps(
-                        permissions,
-                        default=str,
-                    )
-                ),
-            }
-        )
-
-    response = await chat_with_nvidia(
-        messages=fallback_messages,
-        json_mode=True,
-    )
-
-    choices = response.get(
-        "choices",
-        [],
-    )
-
-    if not choices:
-        return None
-
-    content = (
-        choices[0]
-        .get("message", {})
-        .get("content", "")
-        or ""
-    ).strip()
-
-    print("\n" + "=" * 70)
-    print("[GRAPH] FALLBACK LLM RESULT")
-    print("=" * 70)
-    print(content)
-    print("=" * 70)
-
-    fallback_result = extract_json_object(content)
-
-    if fallback_result is None:
-        return None
-
-    if is_failed_format_response(fallback_result):
-        return None
-
-    return normalize_final_response(
-        fallback_result
-    )
-
+# ============================================================
+# FINAL NODE
+# ============================================================
 
 async def final_node(
     state: ChatState,
 ):
+
     existing_response = state.get(
         "final_response"
     )
 
     if existing_response:
+
         return {
             "final_response": existing_response,
         }
@@ -1094,7 +1386,6 @@ async def final_node(
         [],
     )
 
-
     user_message = ""
     user_message_index = -1
 
@@ -1103,9 +1394,14 @@ async def final_node(
         -1,
         -1,
     ):
-        if messages[index].get(
-            "role"
-        ) == "user":
+
+        if (
+            messages[index].get(
+                "role"
+            )
+            == "user"
+        ):
+
             user_message = (
                 messages[index].get(
                     "content",
@@ -1115,16 +1411,16 @@ async def final_node(
             )
 
             user_message_index = index
-            break
 
+            break
 
     current_turn_messages = []
 
     if user_message_index != -1:
+
         current_turn_messages = messages[
             user_message_index + 1:
         ]
-
 
     final_messages = [
         {
@@ -1143,6 +1439,7 @@ async def final_node(
     )
 
     if permissions:
+
         final_messages.append(
             {
                 "role": "system",
@@ -1156,31 +1453,106 @@ async def final_node(
             }
         )
 
+    if any(
+        message.get(
+            "role"
+        ) == "tool"
+        for message in current_turn_messages
+    ):
+
+        final_messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "HARD TOOL RESULT PRESENTATION RULES — FOLLOW EXACTLY:\n"
+                    "1. TOOL DATA is the source of truth. Never invent or change values.\n"
+                    "2. The backend has already filtered the records. Preserve every record unless the user explicitly requests sorting, ranking, filtering, or another ordering. For an explicit ordering request, perform it using only TOOL DATA. Do not invent, merge, duplicate, or remove records.\n"
+                    "3. Never dump all available fields. Display ONLY the fields specified for the matching list type.\n"
+                    "4. PROJECT LIST: output ONLY one ordered HTML list (<ol>) with one <li> per project. EXACT order inside each item: linked Project Name (Public ID) — Manager: ... — Delivery Head: ... — Status: ... — Priority: ... — Expected: Start Date – End Date — Team: Member 1, Member 2. Do NOT display Id, Description, Billing Type, timestamps, or any other fields.\n"
+                    "5. TASK LIST: output ONLY one ordered HTML list. EXACT order: linked Task Name (Public/Task ID) — Project: ... — Status: ... — Priority: ... — Assignee: ... — Due: ....\n"
+                    "6. ISSUE LIST: output ONLY one ordered HTML list. EXACT order: linked Issue Name (Public/Issue ID) — Project: ... — Status: ... — Priority: ... — Assignee: ... — Due: ....\n"
+                    "7. MILESTONE LIST: output ONLY one ordered HTML list. EXACT order: linked Milestone Name (Public/Milestone ID) — Project: ... — Status: ... — Due: ....\n"
+                    "8. TASK LIST ENTITY: output ONLY one ordered HTML list. EXACT order: linked Task List Name — Project: ... — Description: ... when available.\n"
+                    "9. Every list response MUST use <ol><li>...</li></ol>. Never use plain paragraphs, bullets, tables, or an unnumbered list for list queries.\n"
+                    "10. Navigation is mandatory when an entity id is available. The PRIMARY ENTITY NAME must be an HTML <a> using navigation_url. If navigation_url is missing, do not create or guess a URL. Never show a guessed URL as plain text.\n"
+                    "11. Do not display tool names, raw JSON, internal metadata, or fields outside the required format unless the user explicitly asks for them.\n"
+                    "12. The response field must contain simple user-facing HTML. The data field MUST be [] for normal display/list responses; do not copy tool records into data.\n"
+                ),
+            }
+        )
+
     for message in current_turn_messages:
-        if message.get("role") in {
+
+        if message.get(
+            "role"
+        ) in {
             "assistant",
             "tool",
         }:
-            final_messages.append(message)
 
+            final_messages.append(
+                message
+            )
 
-    tool_data = extract_tool_data(
-        current_turn_messages
+    if any(
+        message.get("role") == "tool"
+        for message in current_turn_messages
+    ):
+        final_messages.append(
+            {
+                "role": "system",
+                "content": STRICT_FINAL_OUTPUT_CONTRACT,
+            }
+        )
+
+    tool_data = add_navigation_urls(
+        extract_tool_data(
+            current_turn_messages
+        )
     )
 
-    tool_html = build_tool_results_html(
-        current_turn_messages
+    print(
+        "\n"
+        + "=" * 70
     )
 
-    print("\n" + "=" * 70)
-    print("[GRAPH] TOOL DATA FOR FINAL RESPONSE")
-    print("=" * 70)
-    print(json.dumps(tool_data, indent=2, default=str))
-    print("=" * 70)
+    print(
+        "[GRAPH] TOOL DATA FOR FINAL RESPONSE"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        json.dumps(
+            tool_data,
+            indent=2,
+            default=str,
+        )
+    )
+
+    print(
+        "=" * 70
+    )
+
+    final_messages.append(
+        {
+            "role": "system",
+            "content": (
+                "FINAL RESPONSE MUST BE COMPACT. "
+                "Return only the requested user-facing HTML in response. "
+                "For normal list/display requests, data MUST be an empty array []. "
+                "Do not repeat tool records in data. "
+                "Do not include raw JSON or extra explanation."
+            ),
+        }
+    )
 
     final_response = await chat_with_nvidia(
         messages=final_messages,
         json_mode=True,
+        max_tokens=2048,
     )
 
     choices = final_response.get(
@@ -1191,6 +1563,7 @@ async def final_node(
     result = None
 
     if choices:
+
         final_message = choices[0].get(
             "message",
             {},
@@ -1204,58 +1577,57 @@ async def final_node(
             or ""
         ).strip()
 
-        print("\n" + "=" * 70)
-        print("[GRAPH] FINAL LLM RESULT")
-        print("=" * 70)
+        print(
+            "\n"
+            + "=" * 70
+        )
+
+        print(
+            "[GRAPH] FINAL LLM RESULT"
+        )
+
+        print(
+            "=" * 70
+        )
+
         print(content)
-        print("=" * 70)
 
-        result = extract_json_object(content)
+        print(
+            "=" * 70
+        )
 
-    if (
-        result is not None
-        and not is_failed_format_response(result)
-        and not claims_no_records(result, tool_data)
-    ):
-        return {
-            "final_response": normalize_final_response(result),
-        }
+        result = extract_json_object(
+            content
+        )
 
-    print("\n" + "=" * 70)
-    print("[GRAPH] PYTHON-CONVERTED HTML")
-    print("=" * 70)
-    print(tool_html)
-    print("=" * 70)
-
-    fallback_result = await format_tool_html_with_llm(
-        user_message=user_message,
-        tool_html=tool_html,
-        tool_data=tool_data,
-        permissions=permissions,
-    )
-
-    if fallback_result is not None:
-        print("\n" + "=" * 70)
-        print("[GRAPH] FINAL FALLBACK RESPONSE")
-        print("=" * 70)
-        print(json.dumps(fallback_result, indent=2, default=str))
-        print("=" * 70)
+    if result is not None:
 
         return {
-            "final_response": fallback_result,
+            "final_response": (
+                normalize_final_response(
+                    result
+                )
+            ),
         }
 
     return {
         "final_response": {
             "response_type": "chat",
-            "response": tool_html,
+            "response": "<p>Unable to generate the response.</p>",
             "data": tool_data,
         },
     }
 
 
+# ============================================================
+# BUILD CHAT GRAPH
+# ============================================================
+
 def build_chat_graph():
-    graph = StateGraph(ChatState)
+
+    graph = StateGraph(
+        ChatState
+    )
 
     graph.add_node(
         "llm",

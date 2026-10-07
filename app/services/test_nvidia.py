@@ -1,49 +1,54 @@
 import asyncio
-import json
+import httpx
 
-from app.services.chatbot.nvidia_client import chat_with_nvidia
-from app.services.chatbot.tools import PROJECT_TOOLS
-from app.services.chatbot.tools.prompt import SYSTEM_PROMPT
+from app.core.config import settings
 
 
-async def main():
+async def test_nvidia():
 
-    permissions = {
-        "task-create": True,
-        "task-view": True,
-        "proj-create": True,
-        "proj-view": True,
+    url = settings.NVIDIA_URL
+
+    headers = {
+        "Authorization": f"Bearer {settings.NVIDIA_API_KEY}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
     }
 
-    messages = [
-        {
-            "role": "system",
-            "content": SYSTEM_PROMPT,
-        },
-        {
-            "role": "system",
-            "content": (
-                "SESSION PERMISSIONS:\n"
-                + json.dumps(permissions)
-            ),
-        },
-        {
-            "role": "user",
-            "content": "Who am I?",
-        },
-    ]
+    payload = {
+        "model": settings.NVIDIA_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": "Hello. Reply with exactly: NVIDIA TEST SUCCESS"
+            }
+        ],
+        "temperature": 0.2,
+        "top_p": 0.95,
+        "max_tokens": 100,
+        "stream": False,
+    }
 
-    print("TOOLS COUNT:", len(PROJECT_TOOLS))
-    print("MESSAGE COUNT:", len(messages))
-    print("Calling NVIDIA...")
+    print("=" * 60)
+    print("NVIDIA BASIC TEST")
+    print("=" * 60)
 
-    result = await chat_with_nvidia(
-        messages=messages,
-        tools=PROJECT_TOOLS,
-    )
+    print("URL:", url)
+    print("MODEL:", settings.NVIDIA_MODEL)
 
-    print("\nRESULT:")
-    print(result)
+    async with httpx.AsyncClient(timeout=120.0) as client:
+
+        response = await client.post(
+            url,
+            headers=headers,
+            json=payload,
+        )
+
+        print("STATUS:", response.status_code)
+        print("RESPONSE:")
+        print(response.text)
+
+        response.raise_for_status()
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(test_nvidia())

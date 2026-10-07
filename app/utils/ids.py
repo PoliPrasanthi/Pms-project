@@ -49,7 +49,6 @@ async def get_next_project_id(db: AsyncSession, project_model) -> str:
         num = 0
     return f"{prefix}{num + 1:03d}"
 
-
 async def get_next_sequence_id(
     db: AsyncSession,
     model_class,
@@ -59,29 +58,136 @@ async def get_next_sequence_id(
     is_padded: bool = False,
     model_name: str = "",
 ) -> str:
-    """Async-safe: generate sequential public_id within a project (e.g. TSK-MA-1, BUG-MA-2)."""
-    initials = get_project_initials(project_name)
-    prefix = f"{separator}-{initials}-" if separator else f"{initials}-"
+    """
+    Generate the next sequential public_id within a project.
 
-    stmt = select(model_class.public_id).where(model_class.public_id.like(f"{prefix}%"))
+    Example:
+        TSK-CT-1
+        TSK-CT-2
+        TSK-CT-3
+
+    For a new project, if the generated ID already exists globally,
+    keep incrementing until an unused public_id is found.
+    """
+    initials = get_project_initials(project_name)
+
+    prefix = (
+        f"{separator}-{initials}-"
+        if separator
+        else f"{initials}-"
+    )
+
+    stmt = select(model_class.public_id).where(
+        model_class.public_id.like(f"{prefix}%")
+    )
+
     if hasattr(model_class, "project_id"):
-        stmt = stmt.where(model_class.project_id == project_id)
+        stmt = stmt.where(
+            model_class.project_id == project_id
+        )
 
     result = await db.execute(stmt)
-    all_ids = result.scalars().all()
 
+    all_ids = result.scalars().all()
     max_num = 0
+
     for pid in all_ids:
         if pid:
             val = pid.replace(prefix, "")
+
             try:
                 n = int(val)
+
                 if n > max_num:
                     max_num = n
+
             except ValueError:
                 pass
-
     num = max_num + 1
-    if is_padded:
-        return f"{prefix}{num:03d}"
-    return f"{prefix}{num}"
+
+    while True:
+
+        if is_padded:
+            candidate = f"{prefix}{num:03d}"
+        else:
+            candidate = f"{prefix}{num}"
+
+        # Check whether this public_id already exists
+        # anywhere in the table, not only in this project.
+        existing_stmt = select(model_class.public_id).where(
+            model_class.public_id == candidate
+        )
+
+        existing_result = await db.execute(existing_stmt)
+
+        existing_id = existing_result.scalar_one_or_none()
+
+        if existing_id is None:
+            return candidate
+        
+        num += 1
+
+
+
+
+# async def get_next_sequence_id(
+#     db: AsyncSession,
+#     model_class,
+#     project_name: str,
+#     project_id: int,
+#     separator: str,
+#     is_padded: bool = False,
+#     model_name: str = "",
+# ) -> str:
+
+#     """Async-safe: generate sequential public_id within a project."""
+
+#     initials = get_project_initials(project_name)
+#     prefix = f"{separator}-{initials}-" if separator else f"{initials}-"
+
+#     stmt = select(model_class.public_id).where(
+#         model_class.public_id.like(f"{prefix}%")
+#     )
+
+#     if hasattr(model_class, "project_id"):
+#         stmt = stmt.where(model_class.project_id == project_id)
+
+#     result = await db.execute(stmt)
+#     all_ids = result.scalars().all()
+
+#     # 👇 ADD THESE PRINTS HERE
+#     print("========================================")
+#     print("PROJECT ID   :", project_id)
+#     print("PROJECT NAME :", project_name)
+#     print("PREFIX       :", prefix)
+#     print("FOUND IDS    :", all_ids)
+#     print("========================================")
+
+#     max_num = 0
+
+#     for pid in all_ids:
+#         if pid:
+#             val = pid.replace(prefix, "")
+
+#             try:
+#                 n = int(val)
+
+#                 if n > max_num:
+#                     max_num = n
+
+#             except ValueError:
+#                 pass
+
+#     num = max_num + 1
+
+#     # 👇 Also print the final generated ID
+#     if is_padded:
+#         next_id = f"{prefix}{num:03d}"
+#     else:
+#         next_id = f"{prefix}{num}"
+
+#     print("MAX NUMBER  :", max_num)
+#     print("NEXT ID     :", next_id)
+#     print("========================================")
+
+#     return next_id

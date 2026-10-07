@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from html import escape
 from typing import Any
 
 from langgraph.graph import (
@@ -21,10 +22,12 @@ from app.services.chatbot.tools.project_tools import (
     DEFAULT_ISSUE_VALUES,
     REQUIRED_ISSUE_FIELDS,
     REQUIRED_TASKLIST_FIELDS,
+    REQUIRED_MILESTONE_FIELDS,
     create_task,
     create_project,
     create_issue,
     create_tasklist,
+    create_milestone,
 )
 
 
@@ -102,6 +105,11 @@ CREATION_CONFIG = {
         "required_fields":
             REQUIRED_TASKLIST_FIELDS,
         "name": "tasklist",
+    },
+    "milestone": {
+        "required_fields":
+            REQUIRED_MILESTONE_FIELDS,
+        "name": "milestone",
     },
 }
 
@@ -748,6 +756,255 @@ async def build_confirmation_node(
 
 
 # ============================================================
+# CREATED ENTITY DISPLAY HELPERS
+# ============================================================
+
+def _get_created_entity_data(
+    result: dict[str, Any],
+    entity_type: str,
+) -> dict[str, Any]:
+
+    data = result.get(
+        "data",
+        {},
+    )
+
+    if not isinstance(data, dict):
+        return {}
+
+    entity_data = data.get(
+        entity_type
+    )
+
+    if isinstance(entity_data, dict):
+        return entity_data
+
+    return data
+
+
+def _get_first_value(
+    source: dict[str, Any],
+    keys: tuple[str, ...],
+):
+    for key in keys:
+        value = source.get(key)
+
+        if value is not None and value != "":
+            return value
+
+    return None
+
+
+def _format_created_value(
+    value: Any,
+) -> str:
+
+    # Creation APIs can return nested user/member objects.
+    # Never render those raw dictionaries to the user.
+    if isinstance(value, dict):
+        for key in (
+            "display_name",
+            "name",
+            "full_name",
+        ):
+            display = value.get(key)
+            if display:
+                return str(display)
+
+        first_name = value.get("first_name")
+        last_name = value.get("last_name")
+        if first_name or last_name:
+            return " ".join(
+                str(part)
+                for part in (first_name, last_name)
+                if part
+            )
+
+        # For a nested project member, use its nested user object.
+        nested_user = value.get("user")
+        if isinstance(nested_user, dict):
+            return _format_created_value(nested_user)
+
+        return ""
+
+    if isinstance(value, list):
+        formatted = []
+        for item in value:
+            if item is None:
+                continue
+            item_text = _format_created_value(item)
+            if item_text:
+                formatted.append(item_text)
+        return ", ".join(formatted)
+
+    return str(value)
+
+
+def _build_created_entity_response(
+    entity_type: str,
+    result: dict[str, Any],
+    arguments: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """
+    Build a minimal success response for a newly created entity.
+
+    User-facing response contains only:
+      1. Entity name
+      2. Clickable link to the created entity
+
+    No API fields, nested objects, permissions, dates, status,
+    priority, team members, or other creation data are rendered.
+    """
+
+    entity_data = _get_created_entity_data(
+        result=result,
+        entity_type=entity_type,
+    )
+
+    if not isinstance(entity_data, dict):
+        entity_data = {}
+
+    # --------------------------------------------------------
+    # Merge submitted arguments only for finding the name when
+    # the create API does not return it explicitly.
+    # --------------------------------------------------------
+
+    details = dict(arguments or {})
+    details.update(
+        {
+            key: value
+            for key, value in entity_data.items()
+            if value is not None
+        }
+    )
+
+    # --------------------------------------------------------
+    # CREATED RECORD ID
+    # --------------------------------------------------------
+
+    created_id = _get_first_value(
+        entity_data,
+        (
+            "id",
+            f"{entity_type}_id",
+        ),
+    )
+
+    if created_id is None:
+        created_id = _get_first_value(
+            result,
+            (
+                "id",
+                f"{entity_type}_id",
+            ),
+        )
+
+    # --------------------------------------------------------
+    # ENTITY NAME
+    # --------------------------------------------------------
+
+    name_keys = {
+        "project": (
+            "project_name",
+            "name",
+        ),
+        "task": (
+            "task_name",
+            "name",
+        ),
+        "milestone": (
+            "milestone_name",
+            "name",
+        ),
+        "issue": (
+            "issue_name",
+            "bug_name",
+            "name",
+        ),
+        "tasklist": (
+            "name",
+            "tasklist_name",
+        ),
+    }
+
+    display_name = _get_first_value(
+        details,
+        name_keys.get(
+            entity_type,
+            ("name",),
+        ),
+    )
+
+    if display_name is None:
+        display_name = entity_type.capitalize()
+
+    # --------------------------------------------------------
+    # NAVIGATION URL
+    # --------------------------------------------------------
+
+    navigation_url = _get_first_value(
+        entity_data,
+        ("navigation_url",),
+    )
+
+    if navigation_url is None:
+        navigation_url = _get_first_value(
+            result,
+            ("navigation_url",),
+        )
+
+    route_map = {
+        "project": "projects",
+        "task": "tasks",
+        "milestone": "milestones",
+        "issue": "issues",
+        "tasklist": "tasklists",
+    }
+
+    if (
+        navigation_url is None
+        and created_id is not None
+        and entity_type in route_map
+    ):
+        navigation_url = (
+            f"/{route_map[entity_type]}/{created_id}"
+        )
+
+    # --------------------------------------------------------
+    # SIMPLE USER-FACING RESPONSE
+    # --------------------------------------------------------
+
+    entity_label = entity_type.capitalize()
+    safe_name = escape(str(display_name))
+
+    response = (
+        f"<p><strong>{entity_label} "
+        f'"{safe_name}" created successfully.</strong></p>'
+    )
+
+    if navigation_url:
+        response += (
+            f'<p><a href="{escape(str(navigation_url), quote=True)}">'
+            f"Open {escape(entity_label.lower())}"
+            "</a></p>"
+        )
+
+    # Keep structured data intentionally small as well.
+    created_data = {
+        "type": f"{entity_type}_created",
+        "name": display_name,
+    }
+
+    if created_id is not None:
+        created_data["id"] = created_id
+
+    if navigation_url is not None:
+        created_data["navigation_url"] = navigation_url
+
+    return response, created_data
+
+
+# ============================================================
 # CREATE
 # ============================================================
 
@@ -829,6 +1086,17 @@ async def create_node(
             ],
             arguments=arguments,
         )
+    elif entity_type == "milestone":
+
+        result = await create_milestone(
+            access_token=state[
+                "access_token"
+            ],
+            current_user=state[
+                "current_user"
+            ],
+            arguments=arguments,
+        )
 
     else:
 
@@ -858,17 +1126,18 @@ async def create_node(
             ],
         )
 
+        created_response, created_data = (
+            _build_created_entity_response(
+                entity_type=entity_type,
+                result=result,
+                arguments=arguments,
+            )
+        )
+
         return {
             "response_type": "chat",
-            "response": (
-                f"<p>{entity_type.capitalize()} "
-                "created successfully.</p>"
-            ),
-            "data": {
-                "type": (
-                    f"{entity_type}_created"
-                ),
-            },
+            "response": created_response,
+            "data": created_data,
         }
 
     # ========================================================
