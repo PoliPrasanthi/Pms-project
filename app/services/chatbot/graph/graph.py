@@ -540,21 +540,24 @@ async def llm_node(
     # DETERMINISTIC READ TOOL ROUTING
     # --------------------------------------------------------
     #
-    # Normal PMS data questions must reach the backend even when the
-    # LLM does not emit a tool call by itself. Creation handling above
-    # remains unchanged.
-    #
-    # Examples:
-    #   "show my tasks" -> get_my_tasks
-    #   "sort my tasks by priority" -> get_my_tasks
-    #   "show my projects and tasks" -> both tools
-    #
-    # The final LLM still performs the requested analysis/sorting after
-    # the real tool data is returned.
+    # Run deterministic read routing only on the first pass of a user turn.
+    # Once a tool has returned data, let NVIDIA process that data. Otherwise
+    # the same synthetic read_intent_* call is created repeatedly and the
+    # graph loops forever.
 
-    read_tools = detect_read_tools(user_message)
+    has_tool_result = any(
+        message.get("role") == "tool"
+        for message in messages
+    )
+
+    read_tools = (
+        detect_read_tools(user_message)
+        if not has_tool_result
+        else []
+    )
 
     if read_tools:
+
 
         synthetic_tool_calls = []
 
@@ -981,11 +984,13 @@ def route_after_tools(
     state: ChatState,
 ):
 
-    # Creation workflows already return their final response.
-    # Normal read tools must go directly to the final node.
-    # Sending them back to llm_node would run deterministic read
-    # routing again and call the same tool repeatedly.
-    return "final"
+    if state.get("final_response"):
+        return "final"
+
+    # Always return tool results to the LLM.
+    # The LLM decides whether to analyze the result, answer the user,
+    # or call another available tool.
+    return "llm"
 
 
 # ============================================================
@@ -1303,59 +1308,183 @@ ENTITY_ROUTES = {
     "task": "tasks",
     "issues": "issues",
     "issue": "issues",
-    # "tasklists": "tasklists",
-    # "task_lists": "tasklists",
-    # "tasklist": "tasklists",
+    "tasklists": "tasklists",
+    "task_lists": "tasklists",
+    "tasklist": "tasklists",
     "milestones": "milestones",
     "milestone": "milestones",
 }
 
+ENTITY_NAME_KEYS = {
+    "project": ("project_name", "projectName"),
+    "task": ("task_name", "taskName"),
+    "issue": ("issue_name", "issueName", "bug_name", "bugName"),
+    "milestone": ("milestone_name", "milestoneName"),
+    "tasklist": (
+        "tasklist_name",
+        "task_list_name",
+        "tasklistName",
+        "taskListName",
+    ),
+}
 
-def add_navigation_urls(value):
-    """Add frontend links without filtering or rebuilding entity lists."""
+ENTITY_ROUTE_BY_TYPE = {
+    "project": "projects",
+    "task": "tasks",
+    "issue": "issues",
+    "milestone": "milestones",
+    "tasklist": "tasklists",
+}
+
+ENTITY_HINTS = {
+    "project": "project",
+    "projects": "project",
+    "project_details": "project",
+    "project_record": "project",
+    "task": "task",
+    "tasks": "task",
+    "task_details": "task",
+    "task_record": "task",
+    "issue": "issue",
+    "issues": "issue",
+    "issue_details": "issue",
+    "issue_record": "issue",
+    "defect": "issue",
+    "defects": "issue",
+    "milestone": "milestone",
+    "milestones": "milestone",
+    "milestone_details": "milestone",
+    "milestone_record": "milestone",
+    "tasklist": "tasklist",
+    "tasklists": "tasklist",
+    "task_list": "tasklist",
+    "task_lists": "tasklist",
+    "tasklist_details": "tasklist",
+    "task_list_details": "tasklist",
+    "tasklist_record": "tasklist",
+    "task_list_record": "tasklist",
+}
+
+
+def _first_non_empty(record, *keys):
+    if not isinstance(record, dict):
+        return None
+    for key in keys:
+        value = record.get(key)
+        if value is not None and str(value).strip() != "":
+            return value
+    return None
+
+
+def _detect_entity_type(record, hinted_type=None):
+    # A structural hint (e.g. `tasks`) is stronger than a nested
+    # `project_name` field on a task/issue record.
+    if hinted_type:
+        return hinted_type
+
+    # Prefer the most specific entity fields before project_name because
+    # task/issue/etc. records commonly also contain project_name.
+    for entity_type in (
+        "task",
+        "issue",
+        "milestone",
+        "tasklist",
+        "project",
+    ):
+        if _first_non_empty(record, *ENTITY_NAME_KEYS[entity_type]):
+            return entity_type
+
+    entity_type_value = _first_non_empty(
+        record,
+        "entity_type",
+        "entityType",
+        "type",
+    )
+    if entity_type_value:
+        normalized = str(entity_type_value).strip().lower().replace("-", "_").replace(" ", "_")
+        if normalized in ENTITY_ROUTES:
+            return normalized.rstrip("s")
+        if normalized in ENTITY_HINTS:
+            return ENTITY_HINTS[normalized]
+
+    return None
+
+
+def _add_navigation_to_record(record, entity_type):
+    if not isinstance(record, dict) or not entity_type:
+        return record
+
+    route = ENTITY_ROUTE_BY_TYPE.get(entity_type)
+    if not route:
+        return record
+
+    existing_url = _first_non_empty(
+        record,
+        "navigation_url",
+        "navigationUrl",
+    )
+    record_id = _first_non_empty(record, "id", "pk")
+
+    if not existing_url and record_id is not None:
+        record["navigation_url"] = f"/{route}/{record_id}"
+
+    if entity_type != "project":
+        project_id = _first_non_empty(record, "project_id", "projectId")
+        project_name = _first_non_empty(record, "project_name", "projectName")
+        project_url = _first_non_empty(
+            record,
+            "project_navigation_url",
+            "projectNavigationUrl",
+        )
+        if project_name and project_id is not None and not project_url:
+            record["project_navigation_url"] = f"/projects/{project_id}"
+
+    return record
+
+
+def add_navigation_urls(value, hinted_type=None):
+    """Add navigation URLs consistently, regardless of which PMS wrapper contains the entity records."""
 
     if isinstance(value, list):
-        return [add_navigation_urls(item) for item in value]
+        return [add_navigation_urls(item, hinted_type) for item in value]
 
     if not isinstance(value, dict):
         return value
 
-    result = {
-        key: add_navigation_urls(item)
-        for key, item in value.items()
-    }
+    entity_type = _detect_entity_type(value, hinted_type)
+    result = dict(value)
 
-    for key, route in ENTITY_ROUTES.items():
-        records = result.get(key)
+    if entity_type:
+        _add_navigation_to_record(result, entity_type)
 
-        if isinstance(records, list):
-            for record in records:
-                if isinstance(record, dict) and record.get("id") not in (None, ""):
-                    record.setdefault(
-                        "navigation_url",
-                        f"/{route}/{record['id']}",
-                    )
-
-        elif isinstance(records, dict) and records.get("id") not in (None, ""):
-            records.setdefault(
-                "navigation_url",
-                f"/{route}/{records['id']}",
-            )
+    for key, child in list(result.items()):
+        normalized = (
+            str(key)
+            .strip()
+            .lower()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
+        child_hint = ENTITY_HINTS.get(normalized)
+        result[key] = add_navigation_urls(child, child_hint)
 
     return result
 
 STRICT_FINAL_OUTPUT_CONTRACT = (
     "FINAL OUTPUT CONTRACT — FOLLOW EXACTLY:\n"
-    "For list queries, return ONE ordered HTML list using <ol> and one <li> per record. "
-    "Preserve TOOL DATA record order unless the user explicitly requests sorting, ranking, filtering, or another ordering. For an explicit ordering request, perform that operation using only TOOL DATA. Do not invent, merge, or duplicate records.\n"
-    "Project list exact order: linked Project Name (Public ID) — Manager: ... — Delivery Head: ... — Status: ... — Priority: ... — Expected: Start Date – End Date — Team: .... "
-    "Display no Id, Description, Billing Type, timestamps, or other fields.\n"
-    "Task list exact order: linked Task Name (Task/Public ID) — Project: ... — Status: ... — Priority: ... — Assignee: ... — Due: ....\n"
-    "Issue list exact order: linked Issue Name (Issue/Public ID) — Project: ... — Status: ... — Priority: ... — Assignee: ... — Due: ....\n"
-    "Milestone list exact order: linked Milestone Name (Milestone/Public ID) — Project: ... — Status: ... — Due: ....\n"
-    "Task List exact order: linked Task List Name — Project: ... — Description: ... when available.\n"
-    "The primary entity name MUST be a clickable HTML <a> using navigation_url. If navigation_url is absent and id exists, use /projects/{id}, /tasks/{id}, /issues/{id}, /tasklists/{id}, or /milestones/{id} according to entity type. Never show the URL as text.\n"
-    "Do not output raw JSON, tool names, internal metadata, or fields outside the applicable format unless explicitly requested."
+    "For a normal list/show/get request, display ONLY the compact default fields for that entity.\n"
+    "PROJECT: project name + public_id (or id). NOTHING ELSE unless explicitly requested.\n"
+    "TASK: task name + public_id (or id) + project name. NOTHING ELSE unless explicitly requested.\n"
+    "ISSUE: issue name + public_id (or id) + project name. NOTHING ELSE unless explicitly requested.\n"
+    "MILESTONE: milestone name + public_id (or id) + project name. NOTHING ELSE unless explicitly requested.\n"
+    "TASKLIST: tasklist name + public_id (or id) + project name. NOTHING ELSE unless explicitly requested.\n"
+    "NEVER display status, priority, completion, dates, owner, assignee, manager, delivery head, team, description, hours, billing, timestamps, or other fields for a normal list request.\n"
+    "Only add a field when the user explicitly asks for that field. Include only the requested fields plus the minimum identifying context.\n"
+    "For multiple records, use exactly one <ol> and one <li> per record. Preserve TOOL DATA order. Do not sort unless requested.\n"
+    "PRIMARY ENTITY NAVIGATION IS MANDATORY when a reliable id exists: render the primary entity name as <a href=\"navigation_url\">...</a>. The graph enriches reliable ids with the correct route before this prompt is sent.\n"
+    "For tasks/issues/milestones/tasklists, link the related project name too when a reliable project id/navigation_url exists.\n"
+    "Never show raw URLs, raw JSON, tool names, internal metadata, or unrelated fields.\n"
+    "Return exactly the required JSON object with response_type=chat, user-facing HTML in response, and data=[] for normal display/list responses."
 )
 
 
@@ -1465,34 +1594,53 @@ async def final_node(
                 "role": "system",
                 "content": (
                     "HARD TOOL RESULT PRESENTATION RULES — FOLLOW EXACTLY:\n"
-                    "1. TOOL DATA is the source of truth. Never invent or change values.\n"
-                    "2. The backend has already filtered the records. Preserve every record unless the user explicitly requests sorting, ranking, filtering, or another ordering. For an explicit ordering request, perform it using only TOOL DATA. Do not invent, merge, duplicate, or remove records.\n"
-                    "3. Never dump all available fields. Display ONLY the fields specified for the matching list type.\n"
-                    "4. PROJECT LIST: output ONLY one ordered HTML list (<ol>) with one <li> per project. EXACT order inside each item: linked Project Name (Public ID) — Manager: ... — Delivery Head: ... — Status: ... — Priority: ... — Expected: Start Date – End Date — Team: Member 1, Member 2. Do NOT display Id, Description, Billing Type, timestamps, or any other fields.\n"
-                    "5. TASK LIST: output ONLY one ordered HTML list. EXACT order: linked Task Name (Public/Task ID) — Project: ... — Status: ... — Priority: ... — Assignee: ... — Due: ....\n"
-                    "6. ISSUE LIST: output ONLY one ordered HTML list. EXACT order: linked Issue Name (Public/Issue ID) — Project: ... — Status: ... — Priority: ... — Assignee: ... — Due: ....\n"
-                    "7. MILESTONE LIST: output ONLY one ordered HTML list. EXACT order: linked Milestone Name (Public/Milestone ID) — Project: ... — Status: ... — Due: ....\n"
-                    "8. TASK LIST ENTITY: output ONLY one ordered HTML list. EXACT order: linked Task List Name — Project: ... — Description: ... when available.\n"
-                    "9. Every list response MUST use <ol><li>...</li></ol>. Never use plain paragraphs, bullets, tables, or an unnumbered list for list queries.\n"
-                    "10. Navigation is mandatory when an entity id is available. The PRIMARY ENTITY NAME must be an HTML <a> using navigation_url. If navigation_url is missing, do not create or guess a URL. Never show a guessed URL as plain text.\n"
-                    "11. Do not display tool names, raw JSON, internal metadata, or fields outside the required format unless the user explicitly asks for them.\n"
-                    "12. The response field must contain simple user-facing HTML. The data field MUST be [] for normal display/list responses; do not copy tool records into data.\n"
+                    "1. TOOL DATA is the source of truth. Never invent, change, sort, merge, duplicate, or remove records unless the user explicitly requests an operation.\n"
+                    "2. NEVER dump all available fields. For normal list/show/get requests use only the compact default fields:\n"
+                    "PROJECT = name + public_id (or id) ONLY.\n"
+                    "TASK = name + public_id (or id) + project ONLY.\n"
+                    "ISSUE = name + public_id (or id) + project ONLY.\n"
+                    "MILESTONE = name + public_id (or id) + project ONLY.\n"
+                    "TASKLIST = name + public_id (or id) + project ONLY.\n"
+                    "3. Status, priority, completion, dates, owner, assignee, manager, delivery head, team, description, hours, billing, timestamps, and all other fields are FORBIDDEN by default. Add a field ONLY when the user explicitly asks for it.\n"
+                    "4. Multiple records MUST use exactly one <ol> with one <li> per record, preserving TOOL DATA order.\n"
+                    "5. PRIMARY ENTITY NAVIGATION is mandatory whenever a reliable entity id exists. Use the graph-supplied navigation_url on the entity name.\n"
+                    "6. For task/issue/milestone/tasklist records, link the related project name when a reliable project id/navigation_url exists.\n"
+                    "7. Never show raw URLs, raw JSON, tool names, internal metadata, or unrelated fields.\n"
+                    "8. Return response_type=chat, user-facing HTML in response, and data=[] for normal list/display responses.\n"
                 ),
             }
         )
 
+    # Give the final LLM the SAME navigation-enriched tool data that the
+    # graph uses for validation. Previously the graph enriched `tool_data`
+    # only for logging/fallback, but sent the ORIGINAL tool message to the
+    # final LLM. That made navigation depend on whether a particular user/tool
+    # response already contained `navigation_url`.
     for message in current_turn_messages:
 
-        if message.get(
-            "role"
-        ) in {
-            "assistant",
-            "tool",
-        }:
+        if message.get("role") == "assistant":
+            final_messages.append(message)
+            continue
 
+        if message.get("role") != "tool":
+            continue
+
+        raw_content = message.get("content", "") or ""
+
+        try:
+            parsed_content = json.loads(raw_content)
+            enriched_content = add_navigation_urls(parsed_content)
             final_messages.append(
-                message
+                {
+                    **message,
+                    "content": json.dumps(
+                        enriched_content,
+                        default=str,
+                    ),
+                }
             )
+        except (TypeError, json.JSONDecodeError):
+            final_messages.append(message)
 
     if any(
         message.get("role") == "tool"
@@ -1602,21 +1750,160 @@ async def final_node(
 
     if result is not None:
 
+        normalized_result = normalize_final_response(result)
+        normalized_result["response"] = ensure_navigation_links(
+            normalized_result.get("response", ""),
+            tool_data,
+        )
+
+        if any(message.get("role") == "tool" for message in current_turn_messages):
+            normalized_result["data"] = []
+
         return {
-            "final_response": (
-                normalize_final_response(
-                    result
-                )
-            ),
+            "final_response": normalized_result,
         }
 
     return {
         "final_response": {
             "response_type": "chat",
             "response": "<p>Unable to generate the response.</p>",
-            "data": tool_data,
+            "data": [],
         },
     }
+
+
+# ============================================================
+# GUARANTEE NAVIGATION LINKS IN FINAL HTML
+# ============================================================
+
+def ensure_navigation_links(response_html, tool_data):
+    """Link known PMS entity names after the LLM responds so navigation is not model-dependent."""
+
+    if not isinstance(response_html, str) or not response_html.strip():
+        return response_html
+
+    entities = []
+    seen = set()
+
+    def collect(value, hinted_type=None):
+        if isinstance(value, list):
+            for item in value:
+                collect(item, hinted_type)
+            return
+
+        if not isinstance(value, dict):
+            return
+
+        entity_type = _detect_entity_type(value, hinted_type)
+        if entity_type:
+            name = _first_non_empty(value, *ENTITY_NAME_KEYS[entity_type])
+            entity_id = _first_non_empty(value, "id", "pk")
+            url = _first_non_empty(value, "navigation_url", "navigationUrl")
+            if entity_id is not None and not url:
+                route = ENTITY_ROUTE_BY_TYPE.get(entity_type)
+                if route:
+                    url = f"/{route}/{entity_id}"
+
+            if name and url:
+                key = (entity_type, str(name).strip().casefold(), str(url))
+                if key not in seen:
+                    seen.add(key)
+                    entities.append((str(name).strip(), str(url)))
+
+            if entity_type != "project":
+                project_name = _first_non_empty(value, "project_name", "projectName")
+                project_id = _first_non_empty(value, "project_id", "projectId")
+                project_url = _first_non_empty(
+                    value,
+                    "project_navigation_url",
+                    "projectNavigationUrl",
+                )
+                if project_name and project_id is not None:
+                    project_url = project_url or f"/projects/{project_id}"
+                    project_key = (
+                        "project",
+                        str(project_name).strip().casefold(),
+                        str(project_url),
+                    )
+                    if project_key not in seen:
+                        seen.add(project_key)
+                        entities.append((str(project_name).strip(), str(project_url)))
+
+        for key, child in value.items():
+            normalized = str(key).strip().lower().replace("-", "_").replace(" ", "_")
+            collect(child, ENTITY_HINTS.get(normalized))
+
+    collect(tool_data)
+
+    if not entities:
+        return response_html
+
+    try:
+        from bs4 import BeautifulSoup, NavigableString
+
+        soup = BeautifulSoup(response_html, "html.parser")
+        entities.sort(key=lambda item: len(item[0]), reverse=True)
+
+        def replace_in_text_node(text_node):
+            original = str(text_node)
+            if not original.strip():
+                return
+
+            parent = text_node.parent
+            if parent and parent.name == "a":
+                return
+
+            matches = []
+            lower_original = original.casefold()
+            for name, url in entities:
+                start = 0
+                needle = name.casefold()
+                while True:
+                    index = lower_original.find(needle, start)
+                    if index < 0:
+                        break
+                    matches.append((index, index + len(name), url))
+                    start = index + len(name)
+
+            if not matches:
+                return
+
+            matches.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+            accepted = []
+            cursor = -1
+            for start, end, url in matches:
+                if start >= cursor:
+                    accepted.append((start, end, url))
+                    cursor = end
+
+            if not accepted:
+                return
+
+            nodes = []
+            cursor = 0
+            for start, end, url in accepted:
+                if start > cursor:
+                    nodes.append(NavigableString(original[cursor:start]))
+                anchor = soup.new_tag("a", href=url)
+                anchor.string = original[start:end]
+                nodes.append(anchor)
+                cursor = end
+
+            if cursor < len(original):
+                nodes.append(NavigableString(original[cursor:]))
+
+            for node in nodes:
+                text_node.insert_before(node)
+            text_node.extract()
+
+        for text_node in list(soup.find_all(string=True)):
+            replace_in_text_node(text_node)
+
+        return str(soup)
+
+    except Exception as exc:
+        print("[GRAPH] Navigation post-processing failed:", exc)
+        return response_html
 
 
 # ============================================================

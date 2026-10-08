@@ -152,6 +152,7 @@ async def get_chatbot_projects(
                 delivery_head.get("display_name")
                 or delivery_head.get("name")
             ),
+            "completion_percentage": project.get("completion_percentage"),
             "team_members": formatted_team_members,
             "project_status": status.get("value") or status.get("label"),
             "priority": priority.get("value") or priority.get("label"),
@@ -172,50 +173,99 @@ async def get_chatbot_tasks(
     db: AsyncSession = Depends(get_async_db),
     current_user=Depends(get_current_user),
 ):
-    # Get current user's tasks
+    # Get tasks using the existing PMS task service.
+    # We are NOT creating or changing any permission.
     result = await task_service.get_tasks(
         db,
         skip=0,
         limit=100,
         current_user=current_user,
-        view_level="O",
+        view_level="All",
     )
 
-    tasks = result.get("items", []) if isinstance(result, dict) else result
+    tasks = (
+        result.get("items", [])
+        if isinstance(result, dict)
+        else result
+    )
+
+    # ==========================================================
+    # ONLY TASKS ASSIGNED TO THE LOGGED-IN USER
+    # ==========================================================
+
+    filtered_tasks = []
+
+    for task in tasks:
+
+        # Scalar assignee
+        if task.get("assignee_id") == current_user.id:
+            filtered_tasks.append(task)
+            continue
+
+        # M2M assignees
+        m2m_assignees = task.get("assignees") or []
+
+        assigned_to_current_user = any(
+            isinstance(user, dict)
+            and user.get("id") == current_user.id
+            for user in m2m_assignees
+        )
+
+        if assigned_to_current_user:
+            filtered_tasks.append(task)
+
+    # ==========================================================
+    # FORMAT RESPONSE
+    # ==========================================================
 
     formatted_tasks = []
 
-    for task in tasks:
+    for task in filtered_tasks:
+
         project = task.get("project") or {}
         status = task.get("status_master") or {}
         priority = task.get("priority_master") or {}
 
-        # Get M2M owners
+        # M2M owners
         owners = [
             user.get("display_name") or user.get("name")
             for user in task.get("owners") or []
             if user.get("display_name") or user.get("name")
         ]
 
-        # Get M2M assignees
+        # M2M assignees
         assignees = [
             user.get("display_name") or user.get("name")
             for user in task.get("assignees") or []
             if user.get("display_name") or user.get("name")
         ]
 
-        # Add scalar assignee
+        # Scalar assignee
         assignee = task.get("assignee") or {}
-        assignee_name = assignee.get("display_name") or assignee.get("name")
 
-        if assignee_name and assignee_name not in assignees:
+        assignee_name = (
+            assignee.get("display_name")
+            or assignee.get("name")
+        )
+
+        if (
+            assignee_name
+            and assignee_name not in assignees
+        ):
             assignees.append(assignee_name)
 
-        # Add scalar owner
+        # Scalar owner
         single_owner = task.get("single_owner") or {}
-        owner_name = single_owner.get("display_name") or single_owner.get("name")
 
-        if owner_name and owner_name not in owners:
+        owner_name = (
+            single_owner.get("display_name")
+            or single_owner.get("name")
+        )
+
+        if (
+            owner_name
+            and owner_name not in owners
+        ):
             owners.append(owner_name)
 
         formatted_tasks.append({
@@ -223,20 +273,40 @@ async def get_chatbot_tasks(
             "id": task.get("id"),
             "task_name": task.get("task_name"),
             "project_name": project.get("project_name"),
-            "status": status.get("value") or status.get("label"),
-            "priority": priority.get("value") or priority.get("label"),
+            "status": (
+                status.get("value")
+                or status.get("label")
+            ),
+            "priority": (
+                priority.get("value")
+                or priority.get("label")
+            ),
             "owners": owners,
             "assignees": assignees,
             "start_date": task.get("start_date"),
             "due_date": task.get("due_date"),
-            "completion_percentage": task.get("completion_percentage"),
-            "estimated_hours": task.get("estimated_hours"),
-            "work_hours": task.get("work_hours"),
-            "billing_type": task.get("billing_type"),
-            "description": task.get("description"),
+            "completion_percentage": task.get(
+                "completion_percentage"
+            ),
+            "estimated_hours": task.get(
+                "estimated_hours"
+            ),
+            "work_hours": task.get(
+                "work_hours"
+            ),
+            "billing_type": task.get(
+                "billing_type"
+            ),
+            "description": task.get(
+                "description"
+            ),
         })
 
-    return {"tasks": formatted_tasks}
+    return {
+        "tasks": formatted_tasks
+    }
+
+
 @router.get("/chatbot-user")
 async def get_chatbot_user(
     current_user: User = Depends(get_current_user),

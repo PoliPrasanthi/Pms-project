@@ -26,7 +26,7 @@ REQUIRED_TASK_FIELDS = [
     "project_id",
     "due_date",
     "estimated_hours",
-    "owner_id",
+    "assignees",
     "priority_id",
     "status_id",
     "start_date",
@@ -264,23 +264,18 @@ async def create_task(
         if value is not None
     }
 
+    if payload.get("assignees") is not None:
+        payload["owners"] = payload["assignees"]
+
     async with httpx.AsyncClient(
         timeout=60.0
     ) as client:
-
-        print("\n" + "=" * 60)
-        print("CREATE TASK")
-        print("Payload:", payload)
-        print("=" * 60)
 
         response = await client.post(
             PMS_BASE_URL + PMS_MODULE_URL["tasks"],
             headers=headers,
             json=payload,
         )
-
-        print("STATUS:", response.status_code)
-        print("RESPONSE:", response.text)
 
         if response.status_code >= 400:
             return {
@@ -294,7 +289,6 @@ async def create_task(
             "status_code": response.status_code,
             "data": response.json(),
         }
-
 async def create_project(
     access_token: str,
     current_user,
