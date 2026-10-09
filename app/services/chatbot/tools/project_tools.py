@@ -9,7 +9,7 @@ PMS_BASE_URL = "http://127.0.0.1:8000/api/v1/"
 PMS_MODULE_URL = {
     "projects_details": "chatbot/projects",
     "projects": "projects/",
-    "task_details":"chatbot/tasks",
+    # "task_details":"chatbot/tasks",
     "tasks": "tasks/",
     "tasklists": "tasklists/",
     "tasklists_details": "chatbot/tasklists",
@@ -26,7 +26,8 @@ REQUIRED_TASK_FIELDS = [
     "project_id",
     "due_date",
     "estimated_hours",
-    "assignees",
+    "assignee_emails",
+    "owner_emails",
     "priority_id",
     "status_id",
     "start_date",
@@ -159,7 +160,7 @@ async def get_my_tasks(
 
     async with httpx.AsyncClient() as client:
         response = await client.get(
-            PMS_BASE_URL + PMS_MODULE_URL["task_details"],
+            PMS_BASE_URL + PMS_MODULE_URL["tasks"],
             headers=headers,
             timeout=60.0,
         )
@@ -264,8 +265,8 @@ async def create_task(
         if value is not None
     }
 
-    if payload.get("assignees") is not None:
-        payload["owners"] = payload["assignees"]
+    # if payload.get("assignees") is not None:
+    #     payload["owners"] = payload["assignees"]
 
     async with httpx.AsyncClient(
         timeout=60.0

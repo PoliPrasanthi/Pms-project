@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     DB_NAME: str
     DB_PORT: str
     
-
+    
     NVIDIA_URL: str
     NVIDIA_MODEL: str
     NVIDIA_API_KEY: str

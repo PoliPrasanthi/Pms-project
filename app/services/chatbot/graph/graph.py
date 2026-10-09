@@ -237,6 +237,24 @@ def detect_read_tools(message: str) -> list[str]:
             for pattern in patterns
         )
 
+    # General person lookup (e.g. "Who is Deepak?") searches both authorized
+    # projects and tasks when the user did not specify an entity type.
+    person_lookup = bool(re.search(
+        r"\b(?:who\s+is|who\s+are|do\s+we\s+have|is\s+there|find|search\s+for|look\s+for)\s+"
+        r"(?:anyone\s+named\s+|a\s+person\s+named\s+|any\s+record\s+with\s+the\s+name\s+)?"
+        r"[a-z][a-z .'-]*\??$",
+        text,
+    ))
+
+    if person_lookup and not has((
+        r"\btasks?\b",
+        r"\bprojects?\b",
+        r"\bissues?\b",
+        r"\bmilestones?\b",
+        r"\btask\s*lists?\b",
+    )):
+        return ["get_my_projects", "get_my_tasks"]
+
     # Task lists must be checked separately so the word "task" inside
     # "task list" does not accidentally select get_my_tasks.
     wants_tasklists = has((
@@ -1428,17 +1446,6 @@ def _add_navigation_to_record(record, entity_type):
     if not existing_url and record_id is not None:
         record["navigation_url"] = f"/{route}/{record_id}"
 
-    if entity_type != "project":
-        project_id = _first_non_empty(record, "project_id", "projectId")
-        project_name = _first_non_empty(record, "project_name", "projectName")
-        project_url = _first_non_empty(
-            record,
-            "project_navigation_url",
-            "projectNavigationUrl",
-        )
-        if project_name and project_id is not None and not project_url:
-            record["project_navigation_url"] = f"/projects/{project_id}"
-
     return record
 
 
@@ -1482,7 +1489,7 @@ STRICT_FINAL_OUTPUT_CONTRACT = (
     "Only add a field when the user explicitly asks for that field. Include only the requested fields plus the minimum identifying context.\n"
     "For multiple records, use exactly one <ol> and one <li> per record. Preserve TOOL DATA order. Do not sort unless requested.\n"
     "PRIMARY ENTITY NAVIGATION IS MANDATORY when a reliable id exists: render the primary entity name as <a href=\"navigation_url\">...</a>. The graph enriches reliable ids with the correct route before this prompt is sent.\n"
-    "For tasks/issues/milestones/tasklists, link the related project name too when a reliable project id/navigation_url exists.\n"
+    "For a task-list response, link only each task name to its own task navigation_url. Do not link project names or create project links from task records.\n"
     "Never show raw URLs, raw JSON, tool names, internal metadata, or unrelated fields.\n"
     "Return exactly the required JSON object with response_type=chat, user-facing HTML in response, and data=[] for normal display/list responses."
 )
@@ -1604,7 +1611,7 @@ async def final_node(
                     "3. Status, priority, completion, dates, owner, assignee, manager, delivery head, team, description, hours, billing, timestamps, and all other fields are FORBIDDEN by default. Add a field ONLY when the user explicitly asks for it.\n"
                     "4. Multiple records MUST use exactly one <ol> with one <li> per record, preserving TOOL DATA order.\n"
                     "5. PRIMARY ENTITY NAVIGATION is mandatory whenever a reliable entity id exists. Use the graph-supplied navigation_url on the entity name.\n"
-                    "6. For task/issue/milestone/tasklist records, link the related project name when a reliable project id/navigation_url exists.\n"
+                    "6. For a task-list response, link only each task name to its own task navigation_url. Do not link project names or create project links from task records.\n"
                     "7. Never show raw URLs, raw JSON, tool names, internal metadata, or unrelated fields.\n"
                     "8. Return response_type=chat, user-facing HTML in response, and data=[] for normal list/display responses.\n"
                 ),
@@ -1777,7 +1784,7 @@ async def final_node(
 # ============================================================
 
 def ensure_navigation_links(response_html, tool_data):
-    """Link known PMS entity names after the LLM responds so navigation is not model-dependent."""
+    """Add primary-entity links without deriving project links from task records."""
 
     if not isinstance(response_html, str) or not response_html.strip():
         return response_html
@@ -1799,6 +1806,9 @@ def ensure_navigation_links(response_html, tool_data):
             name = _first_non_empty(value, *ENTITY_NAME_KEYS[entity_type])
             entity_id = _first_non_empty(value, "id", "pk")
             url = _first_non_empty(value, "navigation_url", "navigationUrl")
+
+            # Build a URL only from this record's own ID and entity route.
+            # Never use a task ID as a project ID.
             if entity_id is not None and not url:
                 route = ENTITY_ROUTE_BY_TYPE.get(entity_type)
                 if route:
@@ -1810,27 +1820,22 @@ def ensure_navigation_links(response_html, tool_data):
                     seen.add(key)
                     entities.append((str(name).strip(), str(url)))
 
-            if entity_type != "project":
-                project_name = _first_non_empty(value, "project_name", "projectName")
-                project_id = _first_non_empty(value, "project_id", "projectId")
-                project_url = _first_non_empty(
-                    value,
-                    "project_navigation_url",
-                    "projectNavigationUrl",
-                )
-                if project_name and project_id is not None:
-                    project_url = project_url or f"/projects/{project_id}"
-                    project_key = (
-                        "project",
-                        str(project_name).strip().casefold(),
-                        str(project_url),
-                    )
-                    if project_key not in seen:
-                        seen.add(project_key)
-                        entities.append((str(project_name).strip(), str(project_url)))
-
         for key, child in value.items():
-            normalized = str(key).strip().lower().replace("-", "_").replace(" ", "_")
+            normalized = (
+                str(key).strip().lower()
+                .replace("-", "_")
+                .replace(" ", "_")
+            )
+
+            # A project's name/details may be included as context inside a task.
+            # Do not turn that context into a project navigation link.
+            if entity_type == "task" and normalized in {
+                "project",
+                "project_details",
+                "project_record",
+            }:
+                continue
+
             collect(child, ENTITY_HINTS.get(normalized))
 
     collect(tool_data)
@@ -1855,6 +1860,7 @@ def ensure_navigation_links(response_html, tool_data):
 
             matches = []
             lower_original = original.casefold()
+
             for name, url in entities:
                 start = 0
                 needle = name.casefold()
@@ -1871,23 +1877,23 @@ def ensure_navigation_links(response_html, tool_data):
             matches.sort(key=lambda item: (item[0], -(item[1] - item[0])))
             accepted = []
             cursor = -1
-            for start, end, url in matches:
-                if start >= cursor:
-                    accepted.append((start, end, url))
-                    cursor = end
+            for match_start, match_end, url in matches:
+                if match_start >= cursor:
+                    accepted.append((match_start, match_end, url))
+                    cursor = match_end
 
             if not accepted:
                 return
 
             nodes = []
             cursor = 0
-            for start, end, url in accepted:
-                if start > cursor:
-                    nodes.append(NavigableString(original[cursor:start]))
+            for match_start, match_end, url in accepted:
+                if match_start > cursor:
+                    nodes.append(NavigableString(original[cursor:match_start]))
                 anchor = soup.new_tag("a", href=url)
-                anchor.string = original[start:end]
+                anchor.string = original[match_start:match_end]
                 nodes.append(anchor)
-                cursor = end
+                cursor = match_end
 
             if cursor < len(original):
                 nodes.append(NavigableString(original[cursor:]))
