@@ -1,5 +1,6 @@
 import json
 import html
+import logging
 
 from langgraph.graph import (
     StateGraph,
@@ -20,6 +21,9 @@ from app.services.chatbot.tools import (
 from app.services.chatbot.graph.creation_graph import (
     run_creation_graph,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -320,6 +324,56 @@ def detect_read_tools(message: str) -> list[str]:
     return tools
 
 
+
+def resolve_detail_followup_query(messages: list[dict], user_message: str) -> str | None:
+    """
+    Resolve short follow-ups such as 'more details about it' from the recent
+    conversation. The resulting query is used to fetch fresh authorized PMS
+    records; it does not reuse old tool data as a source of truth.
+    """
+    text = (user_message or "").strip().lower()
+    detail_followup = bool(re.search(
+        r"\b(?:more details|full details|complete details|all details|"
+        r"details about it|details of it|tell me more|explain it|"
+        r"what about its details|show details)\b",
+        text,
+    ))
+    if not detail_followup:
+        return None
+
+    # Most recent assistant answer is the best clue for pronouns like "it".
+    for message in reversed(messages[:-1] if messages else []):
+        if message.get("role") != "assistant":
+            continue
+        content = str(message.get("content") or "").lower()
+        for entity, patterns in (
+            ("issues", (r"\bissues?\b", r"\bdefects?\b", r"\bbug\b")),
+            ("tasks", (r"\btasks?\b",)),
+            ("projects", (r"\bprojects?\b",)),
+            ("milestones", (r"\bmilestones?\b",)),
+            ("tasklists", (r"\btask\s*lists?\b", r"\btasklists?\b")),
+        ):
+            if any(re.search(pattern, content) for pattern in patterns):
+                return f"show {entity} with full details"
+
+    # If the assistant's last response doesn't identify the entity, inspect
+    # earlier user turns, most recent first.
+    for message in reversed(messages[:-1] if messages else []):
+        if message.get("role") != "user":
+            continue
+        prior = str(message.get("content") or "").lower()
+        for entity, patterns in (
+            ("issues", (r"\bissues?\b", r"\bdefects?\b", r"\bbug\b")),
+            ("tasks", (r"\btasks?\b",)),
+            ("projects", (r"\bprojects?\b",)),
+            ("milestones", (r"\bmilestones?\b",)),
+            ("tasklists", (r"\btask\s*lists?\b", r"\btasklists?\b")),
+        ):
+            if any(re.search(pattern, prior) for pattern in patterns):
+                return f"show {entity} with full details"
+    return None
+
+
 # ============================================================
 # ACTUAL CREATION REQUEST
 # ============================================================
@@ -563,13 +617,30 @@ async def llm_node(
     # the same synthetic read_intent_* call is created repeatedly and the
     # graph loops forever.
 
+    latest_user_index = -1
+    for message_index in range(len(messages) - 1, -1, -1):
+        if messages[message_index].get("role") == "user":
+            latest_user_index = message_index
+            break
+
+    current_turn_messages = (
+        messages[latest_user_index + 1:]
+        if latest_user_index >= 0
+        else messages
+    )
     has_tool_result = any(
         message.get("role") == "tool"
-        for message in messages
+        for message in current_turn_messages
     )
 
+    routing_query = user_message
+    if not has_tool_result:
+        detail_query = resolve_detail_followup_query(messages, user_message)
+        if detail_query:
+            routing_query = detail_query
+
     read_tools = (
-        detect_read_tools(user_message)
+        detect_read_tools(routing_query)
         if not has_tool_result
         else []
     )
@@ -607,10 +678,17 @@ async def llm_node(
     # NVIDIA
     # --------------------------------------------------------
 
-    response = await chat_with_nvidia(
-        messages=messages,
-        tools=PROJECT_TOOLS,
-    )
+    # NVIDIA failures must not be converted into empty search results or a
+    # fabricated answer. Log the operation and let the registered FastAPI
+    # exception handlers translate the exception into an HTTP response.
+    try:
+        response = await chat_with_nvidia(
+            messages=messages,
+            tools=PROJECT_TOOLS,
+        )
+    except Exception:
+        logger.exception("NVIDIA request failed in llm_node")
+        raise
 
     choices = response.get(
         "choices",
@@ -618,6 +696,7 @@ async def llm_node(
     )
 
     if not choices:
+        logger.error("NVIDIA response in llm_node did not contain any choices")
 
         return {
             "messages": messages,
@@ -891,24 +970,24 @@ async def tool_node(
             # CREATION GRAPH
             # ------------------------------------------------
 
-            creation_response = (
-                await run_creation_graph(
-                    access_token=state[
-                        "access_token"
-                    ],
+            try:
+                creation_response = await run_creation_graph(
+                    access_token=state["access_token"],
                     current_user=current_user,
                     user_id=user_id,
                     session_id=session_id,
                     entity_type=entity_type,
-                    action=state.get(
-                        "action"
-                    ),
+                    action=state.get("action"),
                     arguments=creation_arguments,
-                    form_data=state.get(
-                        "form_data"
-                    ),
+                    form_data=state.get("form_data"),
                 )
-            )
+            except Exception:
+                logger.exception(
+                    "Creation workflow failed (entity_type=%s)",
+                    entity_type,
+                )
+                # Do not return a success-shaped response when creation failed.
+                raise
 
             return {
                 "messages": messages,
@@ -933,38 +1012,30 @@ async def tool_node(
 
         elif tool_name in READ_TOOLS:
 
-            result = await tool_function(
-                state["access_token"],
-                arguments,
-            )
-
-            print(
-                "\n"
-                + "=" * 70
-            )
-
-            print(
-                "[GRAPH] TOOL OUTPUT"
-            )
-
-            print(
-                "=" * 70
-            )
-
-            print(
-                f"[GRAPH] Tool: {tool_name}"
-            )
-
-            print(
-                json.dumps(
-                    result,
-                    indent=2,
-                    default=str,
+            try:
+                result = await tool_function(
+                    state["access_token"],
+                    arguments,
                 )
-            )
+            except Exception:
+                # Critical: a failed data request is not the same as a
+                # successful request that returned zero records. Re-raise so
+                # the API layer can report a failure instead of telling the
+                # user that no matching tasks/projects were found.
+                logger.exception(
+                    "Read tool execution failed (tool=%s)",
+                    tool_name,
+                )
+                raise
 
-            print(
-                "=" * 70
+            # Avoid logging the complete result: task/project payloads may
+            # contain confidential business data. Record only safe metadata.
+            result_count = len(result) if isinstance(result, (list, dict)) else None
+            logger.debug(
+                "Read tool completed successfully (tool=%s, result_type=%s, item_count=%s)",
+                tool_name,
+                type(result).__name__,
+                result_count,
             )
 
         else:
@@ -1666,30 +1737,37 @@ async def final_node(
         )
     )
 
-    print(
-        "\n"
-        + "=" * 70
+    logger.debug(
+        "Prepared tool data for final response (tool_result_count=%s)",
+        len(tool_data),
     )
 
-    print(
-        "[GRAPH] TOOL DATA FOR FINAL RESPONSE"
-    )
+    # TEMPORARY DEBUG PRINTS: inspect the exact PMS data being prepared for
+    # the final LLM request. Remove or disable these after debugging because
+    # tool results can contain internal/business information.
+    print("\n" + "=" * 90, flush=True)
+    print("[CHATBOT DEBUG] FINAL NODE INPUT", flush=True)
+    print("[CHATBOT DEBUG] User question:", repr(user_message), flush=True)
+    print("[CHATBOT DEBUG] Current-turn tool messages:", flush=True)
+    for tool_index, tool_message in enumerate(
+        [m for m in current_turn_messages if m.get("role") == "tool"],
+        start=1,
+    ):
+        print(f"\n[CHATBOT DEBUG] TOOL RESULT #{tool_index}", flush=True)
+        print(tool_message.get("content", "<no content>"), flush=True)
 
-    print(
-        "=" * 70
-    )
+    print("\n[CHATBOT DEBUG] NAVIGATION-ENRICHED tool_data sent to final processing:", flush=True)
+    print(json.dumps(tool_data, indent=2, ensure_ascii=False, default=str), flush=True)
 
-    print(
-        json.dumps(
-            tool_data,
-            indent=2,
-            default=str,
+    print("\n[CHATBOT DEBUG] Messages being sent to final NVIDIA call:", flush=True)
+    for message_index, final_message in enumerate(final_messages, start=1):
+        print(
+            f"\n--- FINAL MESSAGE #{message_index} | role={final_message.get('role')} ---",
+            flush=True,
         )
-    )
+        print(final_message.get("content", "<no content>"), flush=True)
 
-    print(
-        "=" * 70
-    )
+    print("=" * 90 + "\n", flush=True)
 
     final_messages.append(
         {
@@ -1704,11 +1782,24 @@ async def final_node(
         }
     )
 
-    final_response = await chat_with_nvidia(
-        messages=final_messages,
-        json_mode=True,
-        max_tokens=2048,
-    )
+    # The final synthesis is a separate NVIDIA request and can fail even
+    # after all tools succeeded. Propagate that failure instead of returning
+    # a misleading "no results" or generic formatting response.
+    try:
+        final_response = await chat_with_nvidia(
+            messages=final_messages,
+            json_mode=True,
+            max_tokens=2048,
+        )
+    except Exception:
+        logger.exception("NVIDIA request failed in final_node")
+        raise
+
+    # Print the raw NVIDIA response to compare its answer with the tool data.
+    print("\n" + "=" * 90, flush=True)
+    print("[CHATBOT DEBUG] RAW FINAL NVIDIA RESPONSE:", flush=True)
+    print(json.dumps(final_response, indent=2, ensure_ascii=False, default=str), flush=True)
+    print("=" * 90 + "\n", flush=True)
 
     choices = final_response.get(
         "choices",
@@ -1732,23 +1823,9 @@ async def final_node(
             or ""
         ).strip()
 
-        print(
-            "\n"
-            + "=" * 70
-        )
-
-        print(
-            "[GRAPH] FINAL LLM RESULT"
-        )
-
-        print(
-            "=" * 70
-        )
-
-        print(content)
-
-        print(
-            "=" * 70
+        logger.debug(
+            "Received final LLM response content (length=%s)",
+            len(content),
         )
 
         result = extract_json_object(
@@ -1758,6 +1835,9 @@ async def final_node(
     if result is not None:
 
         normalized_result = normalize_final_response(result)
+        print("\n[CHATBOT DEBUG] PARSED FINAL JSON BEFORE NAVIGATION:", flush=True)
+        print(json.dumps(normalized_result, indent=2, ensure_ascii=False, default=str), flush=True)
+
         normalized_result["response"] = ensure_navigation_links(
             normalized_result.get("response", ""),
             tool_data,
@@ -1766,14 +1846,20 @@ async def final_node(
         if any(message.get("role") == "tool" for message in current_turn_messages):
             normalized_result["data"] = []
 
+        print("\n[CHATBOT DEBUG] FINAL RESPONSE RETURNED TO FRONTEND:", flush=True)
+        print(json.dumps(normalized_result, indent=2, ensure_ascii=False, default=str), flush=True)
+
         return {
             "final_response": normalized_result,
         }
 
+    logger.warning(
+        "Final LLM response did not contain a valid JSON object; using safe fallback"
+    )
     return {
         "final_response": {
             "response_type": "chat",
-            "response": "<p>Unable to generate the response.</p>",
+            "response": "<p>Unable to format the response. Please try again.</p>",
             "data": [],
         },
     }
@@ -1784,20 +1870,41 @@ async def final_node(
 # ============================================================
 
 def ensure_navigation_links(response_html, tool_data):
-    """Add primary-entity links without deriving project links from task records."""
+    """Ensure task and project names link to their own records.
 
+    A task's project is context, not the task itself. When the API returns a
+    nested project object, use that project's own ID. When it returns flat
+    fields (project_id + project_name), use those fields together. Never use a
+    task ID to construct a project URL.
+    """
     if not isinstance(response_html, str) or not response_html.strip():
         return response_html
 
     entities = []
     seen = set()
 
+    def add_entity(entity_type, name, entity_id=None, url=None):
+        if not entity_type or name is None:
+            return
+        name = str(name).strip()
+        if not name:
+            return
+        if not url and entity_id is not None:
+            route = ENTITY_ROUTE_BY_TYPE.get(entity_type)
+            if route:
+                url = f"/{route}/{entity_id}"
+        if not url:
+            return
+        key = (entity_type, name.casefold(), str(url))
+        if key not in seen:
+            seen.add(key)
+            entities.append((name, str(url)))
+
     def collect(value, hinted_type=None):
         if isinstance(value, list):
             for item in value:
                 collect(item, hinted_type)
             return
-
         if not isinstance(value, dict):
             return
 
@@ -1806,19 +1913,29 @@ def ensure_navigation_links(response_html, tool_data):
             name = _first_non_empty(value, *ENTITY_NAME_KEYS[entity_type])
             entity_id = _first_non_empty(value, "id", "pk")
             url = _first_non_empty(value, "navigation_url", "navigationUrl")
+            add_entity(entity_type, name, entity_id, url)
 
-            # Build a URL only from this record's own ID and entity route.
-            # Never use a task ID as a project ID.
-            if entity_id is not None and not url:
-                route = ENTITY_ROUTE_BY_TYPE.get(entity_type)
-                if route:
-                    url = f"/{route}/{entity_id}"
-
-            if name and url:
-                key = (entity_type, str(name).strip().casefold(), str(url))
-                if key not in seen:
-                    seen.add(key)
-                    entities.append((str(name).strip(), str(url)))
+        # Some task endpoints flatten project data instead of returning a
+        # nested `project: {id, name}` object. Support these explicit pairs.
+        # Only add a project link when its own project ID is available.
+        if entity_type == "task":
+            project_id = _first_non_empty(
+                value,
+                "project_id", "projectId", "project_pk", "projectPk",
+            )
+            project_name = _first_non_empty(
+                value,
+                "project_name", "projectName",
+            )
+            if project_name is None:
+                project_value = value.get("project")
+                if isinstance(project_value, str) and project_value.strip():
+                    project_name = project_value
+            project_url = _first_non_empty(
+                value,
+                "project_navigation_url", "projectNavigationUrl",
+            )
+            add_entity("project", project_name, project_id, project_url)
 
         for key, child in value.items():
             normalized = (
@@ -1826,17 +1943,10 @@ def ensure_navigation_links(response_html, tool_data):
                 .replace("-", "_")
                 .replace(" ", "_")
             )
-
-            # A project's name/details may be included as context inside a task.
-            # Do not turn that context into a project navigation link.
-            if entity_type == "task" and normalized in {
-                "project",
-                "project_details",
-                "project_record",
-            }:
-                continue
-
-            collect(child, ENTITY_HINTS.get(normalized))
+            child_hint = ENTITY_HINTS.get(normalized)
+            if normalized in {"project", "project_details", "project_record"}:
+                child_hint = "project"
+            collect(child, child_hint)
 
     collect(tool_data)
 
@@ -1847,20 +1957,20 @@ def ensure_navigation_links(response_html, tool_data):
         from bs4 import BeautifulSoup, NavigableString
 
         soup = BeautifulSoup(response_html, "html.parser")
+        # Prefer longer names first, so a shorter name contained in a longer
+        # project/task name does not steal the match.
         entities.sort(key=lambda item: len(item[0]), reverse=True)
 
         def replace_in_text_node(text_node):
             original = str(text_node)
             if not original.strip():
                 return
-
             parent = text_node.parent
             if parent and parent.name == "a":
                 return
 
             matches = []
             lower_original = original.casefold()
-
             for name, url in entities:
                 start = 0
                 needle = name.casefold()
@@ -1894,7 +2004,6 @@ def ensure_navigation_links(response_html, tool_data):
                 anchor.string = original[match_start:match_end]
                 nodes.append(anchor)
                 cursor = match_end
-
             if cursor < len(original):
                 nodes.append(NavigableString(original[cursor:]))
 
@@ -1906,9 +2015,8 @@ def ensure_navigation_links(response_html, tool_data):
             replace_in_text_node(text_node)
 
         return str(soup)
-
-    except Exception as exc:
-        print("[GRAPH] Navigation post-processing failed:", exc)
+    except Exception:
+        logger.exception("Navigation link post-processing failed")
         return response_html
 
 

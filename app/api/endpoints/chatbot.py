@@ -80,6 +80,21 @@ async def get_my_permissions(
         "permissions": permissions
     }
 
+@router.get("/chatbot-user")
+async def get_chatbot_user(
+    current_user: User = Depends(get_current_user),
+):
+    return {
+        "id": current_user.id,
+        "name": (
+            f"{current_user.first_name or ''} "
+            f"{current_user.last_name or ''}"
+        ).strip(),
+        "role": current_user.role.name
+        if current_user.role
+        else None,
+    }
+
 @router.get("/projects")
 async def get_chatbot_projects(
     db: AsyncSession = Depends(get_async_db),

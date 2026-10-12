@@ -28,7 +28,21 @@ PMS_PERMISSIONS_URL = (
 
 
 def utc_now() -> datetime:
+    """Return an aware UTC timestamp for consistent database storage."""
     return datetime.now(timezone.utc)
+
+
+def to_local_datetime(value: datetime) -> datetime:
+    """Convert a MongoDB timestamp to the machine's local timezone.
+
+    PyMongo commonly returns BSON datetimes as naive UTC values unless the
+    Mongo client is configured with tz_aware=True, so treat naive values as UTC.
+    The runtime machine's configured local timezone is then used for the
+    calendar-day session comparison.
+    """
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone()
 
 
 def html_to_text(
@@ -100,17 +114,23 @@ async def get_or_create_session(
     )
 
     if session:
-        last_activity = session.get(
-            "modified_at",
-            session.get("created_at"),
+        # Session lifetime is based on the machine's local calendar day,
+        # not on 24 hours since the last message. The first request after
+        # local midnight closes yesterday's session and creates a fresh session.
+        session_started_at = session.get(
+            "created_at",
+            session.get("modified_at"),
         )
+        current_time_local = datetime.now().astimezone()
 
-        if last_activity:
-            current_time = utc_now()
-
-            if current_time.date() == last_activity.date():
+        if session_started_at:
+            session_started_local = to_local_datetime(session_started_at)
+            if session_started_local.date() == current_time_local.date():
                 return session
 
+        # Close the previous day's session. Its chat history is retained in
+        # MongoDB, but it will not be loaded into the new session because
+        # load_history() filters by the new session_id.
         now = utc_now()
 
         await chat_sessions_collection.update_one(
