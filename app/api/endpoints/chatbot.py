@@ -97,6 +97,10 @@ async def get_chatbot_user(
 
 @router.get("/projects")
 async def get_chatbot_projects(
+    scope: str | None = None,
+    project_name: str | None = None,
+    public_id: str | None = None,
+    person_name: str | None = None,
     db: AsyncSession = Depends(get_async_db),
     current_user=Depends(get_current_user),
 ):
@@ -104,53 +108,179 @@ async def get_chatbot_projects(
 
     view_level = get_user_view_level(current_user, "proj-view")
 
-    result = await project_service.get_projects(
-        db,
-        skip=0,
-        limit=100,
-        include_all=True,
-        current_user=current_user if view_level not in ("All", None) else None,
-        view_level=view_level,
+    # --------------------------------------------------
+    # 1. Fetch projects using existing permission logic
+    # --------------------------------------------------
+    all_projects = []
+    skip = 0
+    batch_size = 100
+
+    service_user = (
+        current_user
+        if view_level not in ("All", None)
+        else None
     )
 
-    projects = result.get("items", []) if isinstance(result, dict) else result
+    while True:
+        result = await project_service.get_projects(
+            db,
+            skip=skip,
+            limit=batch_size,
+            include_all=True,
+            current_user=service_user,
+            view_level=view_level,
+        )
 
+        if isinstance(result, dict):
+            batch = result.get("items", [])
+            total = result.get("total")
+        else:
+            batch = result
+            total = None
+
+        if not batch:
+            break
+
+        all_projects.extend(batch)
+        skip += len(batch)
+
+        if total is not None and len(all_projects) >= total:
+            break
+
+        if len(batch) < batch_size:
+            break
+
+    # --------------------------------------------------
+    # 2. Get authenticated user's ID
+    # --------------------------------------------------
     current_user_id = getattr(current_user, "id", None)
+
     formatted_projects = []
 
-    for project in projects:
+    def ids_match(first, second):
+        if first is None or second is None:
+            return False
+
+        return str(first) == str(second)
+
+    normalized_scope = (scope or "").strip().lower()
+
+    # --------------------------------------------------
+    # 3. Filter and format projects
+    # --------------------------------------------------
+    for project in all_projects:
         manager = project.get("project_manager") or {}
         delivery_head = project.get("delivery_head") or {}
         team_members = project.get("team_members") or []
 
-        # Check current user's project role
+        # Check project manager.
         is_project_manager = (
-            manager.get("id") == current_user_id
-            or manager.get("user_id") == current_user_id
-            or project.get("project_manager_id") == current_user_id
+            ids_match(manager.get("id"), current_user_id)
+            or ids_match(manager.get("user_id"), current_user_id)
+            or ids_match(
+                project.get("project_manager_id"),
+                current_user_id,
+            )
         )
 
+        # Check delivery head.
         is_delivery_head = (
-            delivery_head.get("id") == current_user_id
-            or delivery_head.get("user_id") == current_user_id
-            or project.get("delivery_head_id") == current_user_id
+            ids_match(delivery_head.get("id"), current_user_id)
+            or ids_match(
+                delivery_head.get("user_id"),
+                current_user_id,
+            )
+            or ids_match(
+                project.get("delivery_head_id"),
+                current_user_id,
+            )
         )
 
+        # Check team membership.
         is_team_member = any(
-            (
-                member.get("user") or {}
-            ).get("id") == current_user_id
-            or (
-                member.get("user") or {}
-            ).get("user_id") == current_user_id
-            or member.get("user_id") == current_user_id
+            ids_match(
+                (member.get("user") or {}).get("id"),
+                current_user_id,
+            )
+            or ids_match(
+                (member.get("user") or {}).get("user_id"),
+                current_user_id,
+            )
+            or ids_match(
+                member.get("user_id"),
+                current_user_id,
+            )
             for member in team_members
         )
 
-        # Include only projects related to current user
-        if not (is_project_manager or is_delivery_head or is_team_member):
-            continue
+        # ----------------------------------------------
+        # 4. Apply "mine" scope
+        # ----------------------------------------------
+        if normalized_scope == "mine":
+            is_associated_with_user = (
+                is_project_manager
+                or is_delivery_head
+                or is_team_member
+            )
 
+            if not is_associated_with_user:
+                continue
+
+        # ----------------------------------------------
+        # 5. Apply optional project-name filter
+        # ----------------------------------------------
+        if project_name:
+            actual_name = str(
+                project.get("project_name") or ""
+            ).strip().lower()
+
+            requested_name = project_name.strip().lower()
+
+            if requested_name not in actual_name:
+                continue
+
+        # ----------------------------------------------
+        # 6. Apply optional public-ID filter
+        # ----------------------------------------------
+        if public_id:
+            actual_public_id = str(
+                project.get("public_id") or ""
+            ).strip().lower()
+
+            if public_id.strip().lower() not in actual_public_id:
+                continue
+
+        # ----------------------------------------------
+        # 7. Apply optional person-name filter
+        # ----------------------------------------------
+        if person_name:
+            requested_person = person_name.strip().lower()
+
+            associated_names = [
+                manager.get("display_name") or manager.get("name"),
+                delivery_head.get("display_name")
+                or delivery_head.get("name"),
+            ]
+
+            for member in team_members:
+                user = member.get("user") or {}
+
+                associated_names.append(
+                    user.get("display_name") or user.get("name")
+                )
+
+            name_matches = any(
+                requested_person in str(name).lower()
+                for name in associated_names
+                if name
+            )
+
+            if not name_matches:
+                continue
+
+        # ----------------------------------------------
+        # 8. Format project response
+        # ----------------------------------------------
         status = project.get("status_master") or {}
         priority = project.get("priority_master") or {}
 
@@ -158,33 +288,55 @@ async def get_chatbot_projects(
             (member.get("user") or {}).get("display_name")
             or (member.get("user") or {}).get("name")
             for member in team_members
-            if (member.get("user") or {}).get("display_name")
-            or (member.get("user") or {}).get("name")
+            if (
+                (member.get("user") or {}).get("display_name")
+                or (member.get("user") or {}).get("name")
+            )
         ]
 
         formatted_projects.append({
             "public_id": project.get("public_id"),
             "project_name": project.get("project_name"),
             "id": project.get("id"),
-            "manager_name": manager.get("display_name") or manager.get("name"),
+            "manager_name": (
+                manager.get("display_name")
+                or manager.get("name")
+            ),
             "delivery_head_name": (
                 delivery_head.get("display_name")
                 or delivery_head.get("name")
             ),
-            "completion_percentage": project.get("completion_percentage"),
+            "completion_percentage": project.get(
+                "completion_percentage"
+            ),
             "team_members": formatted_team_members,
-            "project_status": status.get("value") or status.get("label"),
-            "priority": priority.get("value") or priority.get("label"),
+            "project_status": (
+                status.get("value")
+                or status.get("label")
+            ),
+            "priority": (
+                priority.get("value")
+                or priority.get("label")
+            ),
             "description": project.get("description"),
-            "expected_start_date": project.get("expected_start_date"),
-            "expected_end_date": project.get("expected_end_date"),
+            "expected_start_date": project.get(
+                "expected_start_date"
+            ),
+            "expected_end_date": project.get(
+                "expected_end_date"
+            ),
             "billing_type": project.get("billing_model"),
         })
 
-    print("Projects for current user:", formatted_projects)
+    print(
+        f"[PROJECT DEBUG] User ID: {current_user_id} | "
+        f"Scope: {normalized_scope or 'default'} | "
+        f"Fetched: {len(all_projects)} | "
+        f"Returned: {len(formatted_projects)}",
+        flush=True,
+    )
 
     return {"projects": formatted_projects}
-
 
 @router.get("/tasklists")
 async def get_chatbot_tasklists(
