@@ -414,6 +414,254 @@ def is_actual_creation_request(
 
 
 # ============================================================
+# CURRENT-USER FILTER + SAFE HTML FALLBACK
+# ============================================================
+
+CURRENT_USER_PHRASE = re.compile(
+    r"\b(?:assigned|allocated|delegated|given)\s+to\s+me\b|"
+    r"\b(?:assigned|allocated|delegated|given)\s+me\b|"
+    r"\bmy\s+(?:assigned\s+)?(?:tasks?|projects?|issues?|defects?|milestones?|task\s*lists?|time\s*logs?)\b",
+    re.IGNORECASE,
+)
+
+ENTITY_META = {
+    "get_my_projects": ("project", "projects", ("project_name", "projectName", "name", "title")),
+    "get_my_tasks": ("task", "tasks", ("task_name", "taskName", "name", "title")),
+    "get_my_issues": ("issue", "issues", ("bug_name", "bugName", "issue_name", "issueName", "name", "title")),
+    "get_my_milestones": ("milestone", "milestones", ("milestone_name", "milestoneName", "name", "title")),
+    "get_my_tasklists": ("tasklist", "tasklists", ("tasklist_name", "task_list_name", "tasklistName", "name", "title")),
+    "get_my_timelogs": ("timelog", "time-log", ("description", "task_name", "taskName", "name", "title")),
+}
+
+
+def _normal_text(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+
+def _walk_values(value):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield key, item
+            if isinstance(item, (dict, list)):
+                yield from _walk_values(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _walk_values(item)
+
+
+def _current_user_identity_values(user):
+    values = set()
+    if not isinstance(user, (dict, list)):
+        return values
+    id_keys = {"id", "user_id", "userid", "pk", "user_pk"}
+    name_keys = {"name", "full_name", "fullname", "first_name", "firstname", "last_name", "lastname", "username", "user_name", "email", "email_address"}
+    # IDs are accepted only from the top-level authenticated-user object;
+    # nested role/team IDs must not accidentally identify an assignment.
+    if isinstance(user, dict):
+        for key in id_keys:
+            value = user.get(key)
+            if value is not None and not isinstance(value, (dict, list)):
+                values.add(_normal_text(value))
+    for key, value in _walk_values(user):
+        normalized_key = str(key).lower().replace("-", "_")
+        if value is None or isinstance(value, (dict, list)):
+            continue
+        if normalized_key in name_keys:
+            val = _normal_text(value)
+            if val:
+                values.add(val)
+    # Build a full name from first/last name when supplied separately.
+    if isinstance(user, dict):
+        first = user.get("first_name") or user.get("firstName")
+        last = user.get("last_name") or user.get("lastName")
+        if first or last:
+            values.add(_normal_text(f"{first or ''} {last or ''}"))
+    return values
+
+
+def _record_assignment_matches(record, entity_type, identities):
+    if not isinstance(record, dict) or not identities:
+        return False
+    common = {
+        "task": {"assignee", "assignees", "assignee_name", "assignee_names", "assignee_id", "assignee_ids", "assignee_email", "assignee_emails", "assigned_to", "assigned_to_id", "assigned_to_name", "assigned_user", "assigned_users", "user"},
+        "issue": {"assignee", "assignees", "assignee_name", "assignee_id", "assignee_email", "assignee_emails", "assigned_to", "assigned_to_id", "assigned_user"},
+        "project": {"team", "team_members", "members", "member", "users", "user_emails", "team_emails", "project_manager", "project_manager_name", "project_manager_id", "delivery_head", "delivery_head_name", "delivery_head_id", "owner", "owners", "owner_name", "owner_id", "assigned_to", "assigned_users"},
+        "milestone": {"assignee", "assignees", "owner", "owner_name", "assigned_to", "user", "users"},
+        "tasklist": {"assignee", "assignees", "owner", "owner_name", "assigned_to", "user", "users"},
+        "timelog": {"user", "user_name", "username", "user_id", "logged_by", "logged_by_name", "employee", "employee_name", "created_by", "created_by_name"},
+    }.get(entity_type, set())
+    # Also recognize explicit assignment-related fields without matching unrelated project/task text.
+    for key, value in _walk_values(record):
+        key_norm = str(key).lower().replace("-", "_").replace(" ", "_")
+        relevant = key_norm in common or any(token in key_norm for token in ("assignee", "assigned_to", "team_member", "user_email"))
+        if entity_type == "project":
+            relevant = relevant or any(token in key_norm for token in ("project_manager", "delivery_head", "team", "member", "owner"))
+        if entity_type == "timelog":
+            relevant = relevant or any(token in key_norm for token in ("logged_by", "employee", "user"))
+        if not relevant or value is None:
+            continue
+        candidates = []
+        if isinstance(value, (str, int, float)):
+            candidates = [value]
+        elif isinstance(value, list):
+            candidates = value
+        elif isinstance(value, dict):
+            candidates = [v for k, v in value.items() if str(k).lower() in {"id", "user_id", "name", "full_name", "first_name", "last_name", "username", "email", "email_address"} and not isinstance(v, (dict, list))]
+            first = value.get("first_name") or value.get("firstName")
+            last = value.get("last_name") or value.get("lastName")
+            if first or last:
+                candidates.append(f"{first or ''} {last or ''}")
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                for k, v in candidate.items():
+                    if str(k).lower() in {"id", "user_id", "name", "full_name", "username", "email", "first_name", "last_name"} and v is not None:
+                        if _normal_text(v) in identities:
+                            return True
+                first = candidate.get("first_name") or candidate.get("firstName")
+                last = candidate.get("last_name") or candidate.get("lastName")
+                if (first or last) and _normal_text(f"{first or ''} {last or ''}") in identities:
+                    return True
+            elif _normal_text(candidate) in identities:
+                return True
+    return False
+
+
+def _extract_record_list(value):
+    """Return the most likely record list and its parent/key, supporting common API wrappers."""
+    if isinstance(value, list) and all(isinstance(item, dict) for item in value):
+        return value, None, None
+    if not isinstance(value, dict):
+        return None, None, None
+    for key in ("items", "results", "records", "data", "projects", "tasks", "issues", "milestones", "tasklists", "time_logs", "timelogs"):
+        child = value.get(key)
+        if isinstance(child, list) and (not child or all(isinstance(item, dict) for item in child)):
+            return child, value, key
+        if isinstance(child, dict):
+            found = _extract_record_list(child)
+            if found[0] is not None:
+                return found[0], child, found[2]
+    # API wrappers occasionally contain a single nested result object.
+    for key, child in value.items():
+        if isinstance(child, dict):
+            found = _extract_record_list(child)
+            if found[0] is not None:
+                return found[0], child, found[2]
+    return None, None, None
+
+
+def _filter_records_for_current_user(payload, entity_type, identities):
+    records, parent, key = _extract_record_list(payload)
+    if records is None:
+        return payload, None
+    filtered = [r for r in records if _record_assignment_matches(r, entity_type, identities)]
+    if parent is None:
+        return filtered, len(filtered)
+    parent[key] = filtered
+    for count_key in ("total", "total_count", "filtered_count", "count"):
+        if count_key in parent and isinstance(parent[count_key], (int, float)):
+            parent[count_key] = len(filtered)
+    if isinstance(payload, dict):
+        payload["filtered_count"] = len(filtered)
+    return payload, len(filtered)
+
+
+def _record_date(record):
+    for key in ("updated_at", "updatedAt", "modified_at", "modifiedAt", "created_at", "createdAt", "created_date", "createdDate", "start_date", "startDate", "date", "logged_date"):
+        value = record.get(key) if isinstance(record, dict) else None
+        if value:
+            return str(value)
+    return ""
+
+
+def _safe_html_fallback(messages, user_message=""):
+    """Format current-turn tool records as safe compact HTML if NVIDIA is unavailable."""
+    current_user_index = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=-1)
+    turn = messages[current_user_index + 1:] if current_user_index >= 0 else messages
+    tool_names = {}
+    for message in turn:
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls", []) or []:
+                function = call.get("function", {}) or {}
+                tool_names[call.get("id")] = function.get("name")
+    chunks = []
+    for message in turn:
+        if message.get("role") != "tool":
+            continue
+        tool_name = tool_names.get(message.get("tool_call_id"))
+        meta = ENTITY_META.get(tool_name)
+        if not meta:
+            continue
+        entity_type, route, name_keys = meta
+        try:
+            payload = json.loads(message.get("content") or "null")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and payload.get("error"):
+            chunks.append("<p>I couldn't verify the requested assignment filter because current-user details were unavailable. Please try again.</p>")
+            continue
+        records, _, _ = _extract_record_list(payload)
+        if records is None:
+            continue
+        total = len(records)
+        dated = any(_record_date(record) for record in records)
+        shown = sorted(records, key=_record_date, reverse=True)[:5] if dated else records[:5]
+        if not shown:
+            chunks.append(f"<p>No matching {html.escape(route.replace('-', ' '))} found.</p>")
+            continue
+        title = "time logs" if entity_type == "timelog" else route.replace("-", " ")
+        chunks.append(f"<p>Here are the {html.escape(title)}:</p><ol>")
+        for record in shown:
+            name = next((record.get(k) for k in name_keys if record.get(k) not in (None, "")), None)
+            if name is None:
+                name = f"{title[:-1].title() if title.endswith('s') else title.title()} record"
+            record_id = next((record.get(k) for k in ("id", "pk") if record.get(k) not in (None, "")), None)
+            public_id = next((record.get(k) for k in ("public_id", "publicId", "task_id", "project_id_sync", "issue_id") if record.get(k) not in (None, "")), None)
+            name_html = html.escape(str(name))
+            if record_id is not None:
+                name_html = f'<a href="/{route}/{html.escape(str(record_id), quote=True)}">{name_html}</a>'
+            suffix = f" ({html.escape(str(public_id))})" if public_id is not None else ""
+            project_name = next((record.get(k) for k in ("project_name", "projectName") if record.get(k) not in (None, "")), None)
+            project_id = next((record.get(k) for k in ("project_id", "projectId") if record.get(k) not in (None, "")), None)
+            project_suffix = ""
+            if entity_type != "project" and project_name:
+                pname = html.escape(str(project_name))
+                if project_id is not None:
+                    pname = f'<a href="/projects/{html.escape(str(project_id), quote=True)}">{pname}</a>'
+                project_suffix = f" — Project: {pname}"
+            chunks.append(f"<li>{name_html}{suffix}{project_suffix}</li>")
+        chunks.append("</ol>")
+        if total > 5:
+            chunks.append(f'<p>Showing 5 of {total} records. <a href="/{route}">View more {html.escape(title)}</a></p>')
+    if not chunks:
+        return None
+    return {"response_type": "chat", "response": "".join(chunks), "data": []}
+
+
+async def _current_user_details(access_token):
+    getter = TOOL_FUNCTIONS.get("get_current_user_details")
+    if getter:
+        try:
+            return await getter(access_token, {})
+        except TypeError:
+            return await getter(access_token)
+    # Fallback to the existing authenticated PMS endpoint if the helper is not
+    # registered as a callable tool. Never infer the current user from the prompt.
+    import httpx
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.get(
+            "http://127.0.0.1:8000/api/v1/chatbot/chatbot-user",
+            headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+def _wants_assigned_to_current_user(message):
+    text = _normal_text(message)
+    return bool(re.search(r"\b(?:assigned|allocated|delegated)\s+to\s+me\b|\b(?:assigned|allocated|delegated)\s+me\b", text))
+
+
+# ============================================================
 # LLM NODE
 # ============================================================
 
@@ -688,6 +936,9 @@ async def llm_node(
         )
     except Exception:
         logger.exception("NVIDIA request failed in llm_node")
+        fallback = _safe_html_fallback(messages, user_message)
+        if fallback:
+            return {"messages": messages, "final_response": fallback}
         raise
 
     choices = response.get(
@@ -1027,6 +1278,29 @@ async def tool_node(
                     tool_name,
                 )
                 raise
+
+            # Only the explicit phrase "assigned to me" applies the current-user
+            # filter. "What are my tasks/projects?" remains an unfiltered list request.
+            latest_user_message = next((
+                str(message.get("content") or "")
+                for message in reversed(messages)
+                if message.get("role") == "user"
+            ), "")
+            entity_meta = ENTITY_META.get(tool_name)
+            if entity_meta and _wants_assigned_to_current_user(latest_user_message):
+                entity_type = entity_meta[0]
+                try:
+                    current_user = await _current_user_details(state["access_token"])
+                    identities = _current_user_identity_values(current_user)
+                    if identities:
+                        result, filtered_count = _filter_records_for_current_user(result, entity_type, identities)
+                        logger.info("Applied current-user assignment filter (tool=%s, matched=%s)", tool_name, filtered_count)
+                    else:
+                        logger.warning("Current-user identity returned no matchable values; refusing to claim assignment-filtered results")
+                        result = {"error": "Could not verify the current user's identity to filter assigned records."}
+                except Exception:
+                    logger.exception("Could not fetch current-user details for assignment filter")
+                    result = {"error": "Could not verify the current user's identity to filter assigned records."}
 
             # Avoid logging the complete result: task/project payloads may
             # contain confidential business data. Record only safe metadata.
@@ -1680,7 +1954,7 @@ async def final_node(
                     "MILESTONE = name + public_id (or id) + project ONLY.\n"
                     "TASKLIST = name + public_id (or id) + project ONLY.\n"
                     "3. Status, priority, completion, dates, owner, assignee, manager, delivery head, team, description, hours, billing, timestamps, and all other fields are FORBIDDEN by default. Add a field ONLY when the user explicitly asks for it.\n"
-                    "4. Multiple records MUST use exactly one <ol> with one <li> per record, preserving TOOL DATA order.\n"
+                    "4. For list requests, show at most the 5 most recent records (prefer updated_at/created_at/date descending; if no date exists, preserve TOOL DATA order). Use exactly one <ol> with one <li> per displayed record. If more than 5 records exist, append a View more link to the entity collection route (projects=/projects, tasks=/tasks, issues=/issues, milestones=/milestones, tasklists=/tasklists, time logs=/time-log) and state how many are shown.\n"
                     "5. PRIMARY ENTITY NAVIGATION is mandatory whenever a reliable entity id exists. Use the graph-supplied navigation_url on the entity name.\n"
                     "6. For a task-list response, link only each task name to its own task navigation_url. Do not link project names or create project links from task records.\n"
                     "7. Never show raw URLs, raw JSON, tool names, internal metadata, or unrelated fields.\n"
@@ -1793,6 +2067,9 @@ async def final_node(
         )
     except Exception:
         logger.exception("NVIDIA request failed in final_node")
+        fallback = _safe_html_fallback(messages, user_message)
+        if fallback:
+            return {"final_response": fallback}
         raise
 
     # Print the raw NVIDIA response to compare its answer with the tool data.
@@ -1856,8 +2133,9 @@ async def final_node(
     logger.warning(
         "Final LLM response did not contain a valid JSON object; using safe fallback"
     )
+    fallback = _safe_html_fallback(messages, user_message)
     return {
-        "final_response": {
+        "final_response": fallback or {
             "response_type": "chat",
             "response": "<p>Unable to format the response. Please try again.</p>",
             "data": [],

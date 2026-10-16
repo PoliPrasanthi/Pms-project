@@ -9,7 +9,7 @@ PMS_BASE_URL = "http://127.0.0.1:8000/api/v1/"
 PMS_MODULE_URL = {
     "projects_details": "chatbot/projects",
     "projects": "projects/",
-    # "task_details":"chatbot/tasks",
+    "task_details": "chatbot/tasks",
     "tasks": "tasks/",
     "tasklists": "tasklists/",
     "tasklists_details": "chatbot/tasklists",
@@ -160,7 +160,7 @@ async def get_my_tasks(
 
     async with httpx.AsyncClient() as client:
         response = await client.get(
-            PMS_BASE_URL + PMS_MODULE_URL["tasks"],
+            PMS_BASE_URL + PMS_MODULE_URL["task_details"],
             headers=headers,
             timeout=60.0,
         )

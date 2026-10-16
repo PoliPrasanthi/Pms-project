@@ -338,6 +338,160 @@ async def get_chatbot_projects(
 
     return {"projects": formatted_projects}
 
+
+@router.get("/tasks")
+async def get_chatbot_tasks(
+    scope: str | None = None,
+    task_name: str | None = None,
+    project_name: str | None = None,
+    public_id: str | None = None,
+    person_name: str | None = None,
+    status: str | None = None,
+    priority: str | None = None,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return chatbot-ready tasks using the same permission-aware pattern as projects."""
+    from app.core.security import get_user_view_level
+
+    view_level = get_user_view_level(current_user, "task-view")
+    service_user = current_user if view_level not in ("All", None) else None
+
+    # Fetch every page. The service applies its existing RBAC rules on each page.
+    all_tasks = []
+    skip = 0
+    batch_size = 100
+    while True:
+        result = await task_service.get_tasks(
+            db,
+            skip=skip,
+            limit=batch_size,
+            current_user=service_user,
+            view_level=view_level or "O",
+            return_raw=True,
+        )
+        if isinstance(result, dict):
+            batch = result.get("items", [])
+            total = result.get("total")
+        else:
+            batch = result or []
+            total = None
+
+        if not batch:
+            break
+        all_tasks.extend(batch)
+        skip += len(batch)
+        if total is not None and len(all_tasks) >= total:
+            break
+        if len(batch) < batch_size:
+            break
+
+    current_user_id = getattr(current_user, "id", None)
+
+    def value(obj, key, default=None):
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    def display_name(user):
+        if not user:
+            return None
+        first = value(user, "first_name", "") or ""
+        last = value(user, "last_name", "") or ""
+        name = f"{first} {last}".strip()
+        return name or value(user, "display_name") or value(user, "name")
+
+    def same_id(a, b):
+        return a is not None and b is not None and str(a) == str(b)
+
+    normalized_scope = (scope or "").strip().lower()
+    requested_task = (task_name or "").strip().lower()
+    requested_project = (project_name or "").strip().lower()
+    requested_public_id = (public_id or "").strip().lower()
+    requested_person = (person_name or "").strip().lower()
+    requested_status = (status or "").strip().lower()
+    requested_priority = (priority or "").strip().lower()
+
+    formatted_tasks = []
+    for task in all_tasks:
+        project = value(task, "project")
+        task_list_obj = value(task, "task_list")
+        milestone = value(task, "milestone")
+        status_obj = value(task, "status_master")
+        priority_obj = value(task, "priority_master")
+        status_name = value(status_obj, "value") or value(status_obj, "label") or value(status_obj, "name")
+        priority_name = value(priority_obj, "value") or value(priority_obj, "label") or value(priority_obj, "name")
+        project_title = value(project, "project_name")
+        task_title = value(task, "task_name") or ""
+        task_public_id = value(task, "public_id") or ""
+
+        primary_owner = value(task, "single_owner")
+        if primary_owner is None:
+            primary_owner = value(task, "owner")
+        primary_assignee = value(task, "assignee")
+        owners = list(value(task, "owners", []) or [])
+        assignees = list(value(task, "assignees", []) or [])
+        owner_names = list(dict.fromkeys(n for n in [display_name(primary_owner), *(display_name(u) for u in owners)] if n))
+        assignee_names = list(dict.fromkeys(n for n in [display_name(primary_assignee), *(display_name(u) for u in assignees)] if n))
+
+        # Explicit "mine" scope means ownership/assignment/creation by this user.
+        if normalized_scope == "mine":
+            user_is_owner = same_id(value(task, "owner_id"), current_user_id) or same_id(value(primary_owner, "id"), current_user_id) or any(same_id(value(u, "id"), current_user_id) for u in owners)
+            user_is_assignee = same_id(value(task, "assignee_id"), current_user_id) or same_id(value(primary_assignee, "id"), current_user_id) or any(same_id(value(u, "id"), current_user_id) for u in assignees)
+            user_created = same_id(value(task, "created_by_id"), current_user_id) or same_id(value(value(task, "creator"), "id"), current_user_id)
+            if not (user_is_owner or user_is_assignee or user_created):
+                continue
+
+        if requested_task and requested_task not in task_title.lower():
+            continue
+        if requested_public_id and requested_public_id not in str(task_public_id).lower():
+            continue
+        if requested_project and requested_project not in str(project_title or "").lower():
+            continue
+        if requested_status and requested_status not in str(status_name or "").lower():
+            continue
+        if requested_priority and requested_priority not in str(priority_name or "").lower():
+            continue
+        if requested_person:
+            people = owner_names + assignee_names
+            creator_name = display_name(value(task, "creator"))
+            if creator_name:
+                people.append(creator_name)
+            if not any(requested_person in name.lower() for name in people):
+                continue
+
+        formatted_tasks.append({
+            "id": value(task, "id"),
+            "public_id": task_public_id,
+            "task_name": task_title,
+            "description": value(task, "description"),
+            "project_id": value(task, "project_id"),
+            "project_name": project_title,
+            "task_list_id": value(task, "task_list_id"),
+            "task_list_name": value(task_list_obj, "name"),
+            "milestone_id": value(task, "milestone_id"),
+            "milestone_name": value(milestone, "milestone_name") or value(milestone, "name"),
+            "owner_name": owner_names[0] if owner_names else None,
+            "owners": owner_names,
+            "assignee_name": assignee_names[0] if assignee_names else None,
+            "assignees": assignee_names,
+            "status": status_name,
+            "priority": priority_name,
+            "completion_percentage": value(task, "completion_percentage"),
+            "start_date": str(value(task, "start_date")) if value(task, "start_date") is not None else None,
+            "due_date": str(value(task, "due_date")) if value(task, "due_date") is not None else None,
+            "estimated_hours": value(task, "estimated_hours"),
+            "work_hours": value(task, "work_hours"),
+        })
+
+    print(
+        f"[CHATBOT TASK DEBUG] User ID: {current_user_id} | Scope: {normalized_scope or 'default'} | Fetched: {len(all_tasks)} | Returned: {len(formatted_tasks)}",
+        flush=True,
+    )
+    return {"tasks": formatted_tasks}
+
 @router.get("/tasklists")
 async def get_chatbot_tasklists(
     db: AsyncSession = Depends(get_async_db),
