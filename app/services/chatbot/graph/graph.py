@@ -1,6 +1,7 @@
 import json
 import html
 import logging
+from difflib import SequenceMatcher
 
 from langgraph.graph import (
     StateGraph,
@@ -438,6 +439,32 @@ def _normal_text(value):
     return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
 
 
+def _identity_matches(candidate, identities):
+    """Match exact IDs/names, or a requested first/last name within a full name."""
+    candidate_text = _normal_text(candidate)
+    if not candidate_text:
+        return False
+    normalized_identities = {_normal_text(value) for value in identities if _normal_text(value)}
+    if candidate_text in normalized_identities:
+        return True
+
+    # Name-only partial matching lets a query such as 'Rohini' match the returned
+    # full name 'Rohini Senthil Kumar'. Keep numeric IDs exact to avoid ID collisions.
+    if not candidate_text.isdigit():
+        candidate_tokens = set(re.findall(r"[a-z0-9@._+-]+", candidate_text))
+        for identity in normalized_identities:
+            if not identity.isdigit() and identity in candidate_tokens:
+                return True
+    return False
+
+
+def _normalize_field_name(value):
+    """Normalize snake_case, camelCase, and spaced API field names."""
+    value = str(value or "")
+    value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
+    return re.sub(r"[-\s]+", "_", value).lower()
+
+
 def _walk_values(value):
     if isinstance(value, dict):
         for key, item in value.items():
@@ -479,23 +506,42 @@ def _current_user_identity_values(user):
     return values
 
 
-def _record_assignment_matches(record, entity_type, identities):
+def _record_assignment_matches(record, entity_type, identities, include_owner=False):
     if not isinstance(record, dict) or not identities:
         return False
     common = {
-        "task": {"assignee", "assignees", "assignee_name", "assignee_names", "assignee_id", "assignee_ids", "assignee_email", "assignee_emails", "assigned_to", "assigned_to_id", "assigned_to_name", "assigned_user", "assigned_users", "user"},
-        "issue": {"assignee", "assignees", "assignee_name", "assignee_id", "assignee_email", "assignee_emails", "assigned_to", "assigned_to_id", "assigned_user"},
-        "project": {"team", "team_members", "members", "member", "users", "user_emails", "team_emails", "project_manager", "project_manager_name", "project_manager_id", "delivery_head", "delivery_head_name", "delivery_head_id", "owner", "owners", "owner_name", "owner_id", "assigned_to", "assigned_users"},
+        "task": {"assignee", "assignees", "assignee_name", "assignee_names", "assignee_id", "assignee_ids", "assignee_email", "assignee_emails", "assigned_to", "assigned_to_id", "assigned_to_name", "assigned_user", "assigned_users", "task_owner", "task_owners", "task_owner_name", "task_owner_names", "task_owner_id", "task_owner_ids", "user"},
+        "issue": {"assignee", "assignees", "assignee_name", "assignee_id", "assignee_email", "assignee_emails", "assigned_to", "assigned_to_id", "assigned_user", "reporter", "reporter_name", "created_by"},
+        # For "my projects" / "projects assigned to me", membership means
+        # the authenticated user appears in the project team-member data.
+        # Ownership or manager status alone is not team membership.
+        "project": {"team", "team_members", "team_member", "team_member_ids", "team_members_ids", "project_members", "project_member", "members", "member", "users", "user_emails", "team_emails", "team_member_names", "team_member_emails", "manager_name", "project_manager_name", "delivery_head_name", "project_manager", "delivery_head"},
         "milestone": {"assignee", "assignees", "owner", "owner_name", "assigned_to", "user", "users"},
         "tasklist": {"assignee", "assignees", "owner", "owner_name", "assigned_to", "user", "users"},
         "timelog": {"user", "user_name", "username", "user_id", "logged_by", "logged_by_name", "employee", "employee_name", "created_by", "created_by_name"},
     }.get(entity_type, set())
+    if include_owner and entity_type == "task":
+        common = common | {
+            "owner", "owners", "owner_name", "owner_names",
+            "created_by", "creator", "creator_name",
+        }
     # Also recognize explicit assignment-related fields without matching unrelated project/task text.
     for key, value in _walk_values(record):
-        key_norm = str(key).lower().replace("-", "_").replace(" ", "_")
-        relevant = key_norm in common or any(token in key_norm for token in ("assignee", "assigned_to", "team_member", "user_email"))
+        key_norm = _normalize_field_name(key)
+        relevant = key_norm in common or any(token in key_norm for token in ("assignee", "assigned_to", "task_owner", "team_member", "user_email"))
         if entity_type == "project":
-            relevant = relevant or any(token in key_norm for token in ("project_manager", "delivery_head", "team", "member", "owner"))
+            # "My projects" specifically means team membership, not ownership
+            # or manager status by itself.
+            relevant = (
+                key_norm in common
+                or "team_member" in key_norm
+                or key_norm in {
+                    "team", "members", "member", "users", "project_members",
+                    "project_member", "user_emails", "team_emails",
+                    "manager_name", "project_manager_name", "delivery_head_name",
+                    "project_manager", "delivery_head",
+                }
+            )
         if entity_type == "timelog":
             relevant = relevant or any(token in key_norm for token in ("logged_by", "employee", "user"))
         if not relevant or value is None:
@@ -506,7 +552,7 @@ def _record_assignment_matches(record, entity_type, identities):
         elif isinstance(value, list):
             candidates = value
         elif isinstance(value, dict):
-            candidates = [v for k, v in value.items() if str(k).lower() in {"id", "user_id", "name", "full_name", "first_name", "last_name", "username", "email", "email_address"} and not isinstance(v, (dict, list))]
+            candidates = [v for k, v in value.items() if _normalize_field_name(k) in {"id", "user_id", "name", "full_name", "first_name", "last_name", "username", "email", "email_address"} and not isinstance(v, (dict, list))]
             first = value.get("first_name") or value.get("firstName")
             last = value.get("last_name") or value.get("lastName")
             if first or last:
@@ -514,14 +560,14 @@ def _record_assignment_matches(record, entity_type, identities):
         for candidate in candidates:
             if isinstance(candidate, dict):
                 for k, v in candidate.items():
-                    if str(k).lower() in {"id", "user_id", "name", "full_name", "username", "email", "first_name", "last_name"} and v is not None:
-                        if _normal_text(v) in identities:
+                    if _normalize_field_name(k) in {"id", "user_id", "name", "full_name", "username", "email", "first_name", "last_name"} and v is not None:
+                        if _identity_matches(v, identities):
                             return True
                 first = candidate.get("first_name") or candidate.get("firstName")
                 last = candidate.get("last_name") or candidate.get("lastName")
-                if (first or last) and _normal_text(f"{first or ''} {last or ''}") in identities:
+                if (first or last) and _identity_matches(f"{first or ''} {last or ''}", identities):
                     return True
-            elif _normal_text(candidate) in identities:
+            elif _identity_matches(candidate, identities):
                 return True
     return False
 
@@ -549,15 +595,22 @@ def _extract_record_list(value):
     return None, None, None
 
 
-def _filter_records_for_current_user(payload, entity_type, identities):
+def _filter_records_for_current_user(payload, entity_type, identities, include_owner=False):
     records, parent, key = _extract_record_list(payload)
     if records is None:
         return payload, None
-    filtered = [r for r in records if _record_assignment_matches(r, entity_type, identities)]
+    filtered = [r for r in records if _record_assignment_matches(r, entity_type, identities, include_owner=include_owner)]
     if parent is None:
         return filtered, len(filtered)
     parent[key] = filtered
-    for count_key in ("total", "total_count", "filtered_count", "count"):
+    # Keep count metadata consistent with the filtered records. APIs may use
+    # different naming conventions for project totals.
+    count_keys = (
+        "total", "total_count", "totalCount", "filtered_count", "filteredCount",
+        "count", "total_projects", "totalProjects", "projects_count", "projectsCount",
+        "total_records", "totalRecords", "total_items", "totalItems",
+    )
+    for count_key in count_keys:
         if count_key in parent and isinstance(parent[count_key], (int, float)):
             parent[count_key] = len(filtered)
     if isinstance(payload, dict):
@@ -574,64 +627,189 @@ def _record_date(record):
 
 
 def _safe_html_fallback(messages, user_message=""):
-    """Format current-turn tool records as safe compact HTML if NVIDIA is unavailable."""
-    current_user_index = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=-1)
+    """Render authorized current-turn tool results if final LLM formatting fails.
+
+    This is deliberately a presentation fallback only: it uses tool results,
+    preserves their order unless reliable dates are available, displays at most
+    five records, and uses server-provided pagination metadata when present.
+    """
+    current_user_index = max(
+        (i for i, message in enumerate(messages) if message.get("role") == "user"),
+        default=-1,
+    )
     turn = messages[current_user_index + 1:] if current_user_index >= 0 else messages
+
     tool_names = {}
     for message in turn:
-        if message.get("role") == "assistant":
-            for call in message.get("tool_calls", []) or []:
-                function = call.get("function", {}) or {}
-                tool_names[call.get("id")] = function.get("name")
+        if message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls", []) or []:
+            function = call.get("function", {}) or {}
+            tool_names[call.get("id")] = function.get("name")
+
     chunks = []
+    seen_entities = set()
+
     for message in turn:
         if message.get("role") != "tool":
             continue
+
         tool_name = tool_names.get(message.get("tool_call_id"))
         meta = ENTITY_META.get(tool_name)
         if not meta:
             continue
+
         entity_type, route, name_keys = meta
+        # Task lists are shown on the existing Tasks page.
+        if entity_type == "tasklist":
+            route = "tasks"
+
         try:
             payload = json.loads(message.get("content") or "null")
         except (TypeError, json.JSONDecodeError):
             continue
+
         if isinstance(payload, dict) and payload.get("error"):
-            chunks.append("<p>I couldn't verify the requested assignment filter because current-user details were unavailable. Please try again.</p>")
+            chunks.append(
+                "<p>I couldn't retrieve the requested records right now. Please try again.</p>"
+            )
             continue
-        records, _, _ = _extract_record_list(payload)
+
+        if isinstance(payload, dict) and payload.get("clarification"):
+            question = html.escape(str(payload.get("clarification")))
+            chunks.append(f"<p>{question}</p>")
+            choices = payload.get("available_projects") or []
+            if choices:
+                chunks.append("<p>Here are the project names I can see:</p><ul>")
+                for choice in choices:
+                    chunks.append(f"<li>{html.escape(str(choice))}</li>")
+                chunks.append("</ul>")
+            continue
+
+        records, parent, _ = _extract_record_list(payload)
         if records is None:
             continue
-        total = len(records)
-        dated = any(_record_date(record) for record in records)
-        shown = sorted(records, key=_record_date, reverse=True)[:5] if dated else records[:5]
-        if not shown:
-            chunks.append(f"<p>No matching {html.escape(route.replace('-', ' '))} found.</p>")
+
+        # Avoid rendering the same tool/entity twice if the graph contains a
+        # repeated tool message for the same entity type.
+        if entity_type in seen_entities:
             continue
+        seen_entities.add(entity_type)
+
+        # Prefer explicit, server-provided totals/has_more. A page length is
+        # not a reliable total when the API has already paginated the results.
+        metadata_sources = [payload]
+        if isinstance(parent, dict) and parent is not payload:
+            metadata_sources.insert(0, parent)
+
+        total_count = None
+        has_more = False
+        for source in metadata_sources:
+            if not isinstance(source, dict):
+                continue
+            # Support common total-count names used by task and project APIs.
+            # Never guess a total from a paginated page size.
+            for count_key in (
+                "total_count", "totalCount", "total", "filtered_count", "filteredCount",
+                "count", "total_projects", "totalProjects", "projects_count", "projectsCount",
+                "total_records", "totalRecords", "total_items", "totalItems",
+                "project_count", "projectCount", "task_count", "taskCount",
+            ):
+                count_value = source.get(count_key)
+                if isinstance(count_value, int) and not isinstance(count_value, bool) and count_value >= 0:
+                    total_count = count_value
+                    break
+            if (
+                source.get("has_more") is True
+                or source.get("hasMore") is True
+                or source.get("has_next") is True
+                or source.get("hasNext") is True
+            ):
+                has_more = True
+            if source.get("has_more") is False or source.get("hasMore") is False:
+                # An explicit false is authoritative unless a later source
+                # provides a true value.
+                has_more = False
+            if total_count is not None:
+                break
+
+        dated = any(_record_date(record) for record in records)
+        ordered_records = sorted(records, key=_record_date, reverse=True) if dated else list(records)
+        shown = ordered_records[:5]
+
         title = "time logs" if entity_type == "timelog" else route.replace("-", " ")
+        if not shown:
+            chunks.append(f"<p>No matching {html.escape(title)} found.</p>")
+            continue
+
         chunks.append(f"<p>Here are the {html.escape(title)}:</p><ol>")
         for record in shown:
-            name = next((record.get(k) for k in name_keys if record.get(k) not in (None, "")), None)
+            name = next(
+                (record.get(key) for key in name_keys if record.get(key) not in (None, "")),
+                None,
+            )
             if name is None:
-                name = f"{title[:-1].title() if title.endswith('s') else title.title()} record"
-            record_id = next((record.get(k) for k in ("id", "pk") if record.get(k) not in (None, "")), None)
-            public_id = next((record.get(k) for k in ("public_id", "publicId", "task_id", "project_id_sync", "issue_id") if record.get(k) not in (None, "")), None)
+                singular = title[:-1].title() if title.endswith("s") else title.title()
+                name = f"{singular} record"
+
+            record_id = next(
+                (record.get(key) for key in ("id", "pk") if record.get(key) not in (None, "")),
+                None,
+            )
+            public_id = next(
+                (record.get(key) for key in ("public_id", "publicId", "task_id", "project_id_sync", "issue_id") if record.get(key) not in (None, "")),
+                None,
+            )
+
             name_html = html.escape(str(name))
-            if record_id is not None:
-                name_html = f'<a href="/{route}/{html.escape(str(record_id), quote=True)}">{name_html}</a>'
+            navigation_url = record.get("navigation_url") or record.get("navigationUrl")
+            if isinstance(navigation_url, str) and navigation_url.startswith("/") and not navigation_url.startswith("//"):
+                href = html.escape(navigation_url, quote=True)
+            elif record_id is not None:
+                href = f"/{route}/{html.escape(str(record_id), quote=True)}"
+            else:
+                href = None
+            if href:
+                name_html = f'<a href="{href}">{name_html}</a>'
+
             suffix = f" ({html.escape(str(public_id))})" if public_id is not None else ""
-            project_name = next((record.get(k) for k in ("project_name", "projectName") if record.get(k) not in (None, "")), None)
-            project_id = next((record.get(k) for k in ("project_id", "projectId") if record.get(k) not in (None, "")), None)
+            project_name = next(
+                (record.get(key) for key in ("project_name", "projectName") if record.get(key) not in (None, "")),
+                None,
+            )
+            project_id = next(
+                (record.get(key) for key in ("project_id", "projectId") if record.get(key) not in (None, "")),
+                None,
+            )
             project_suffix = ""
             if entity_type != "project" and project_name:
-                pname = html.escape(str(project_name))
+                safe_project_name = html.escape(str(project_name))
                 if project_id is not None:
-                    pname = f'<a href="/projects/{html.escape(str(project_id), quote=True)}">{pname}</a>'
-                project_suffix = f" — Project: {pname}"
+                    safe_project_name = (
+                        f'<a href="/projects/{html.escape(str(project_id), quote=True)}">'
+                        f"{safe_project_name}</a>"
+                    )
+                project_suffix = f" — Project: {safe_project_name}"
+
             chunks.append(f"<li>{name_html}{suffix}{project_suffix}</li>")
         chunks.append("</ol>")
-        if total > 5:
-            chunks.append(f'<p>Showing 5 of {total} records. <a href="/{route}">View more {html.escape(title)}</a></p>')
+
+        # Only claim more results when the API explicitly confirms them, or
+        # when an authoritative total is greater than the number displayed.
+        # More than five returned records is itself proof that more can be viewed.
+        more_available = (
+            has_more
+            or (total_count is not None and total_count > len(shown))
+            or len(records) > len(shown)
+        )
+        if more_available:
+            if total_count is not None:
+                remaining = max(total_count - len(shown), 0)
+                label = f"View More ({remaining:,} more {title})" if remaining else f"View more {title}"
+            else:
+                label = f"View more {title}"
+            chunks.append(f'<p><a href="/{route}">{html.escape(label)}</a></p>')
+
     if not chunks:
         return None
     return {"response_type": "chat", "response": "".join(chunks), "data": []}
@@ -657,8 +835,232 @@ async def _current_user_details(access_token):
 
 
 def _wants_assigned_to_current_user(message):
+    """Return True when the user asks for their own assigned work.
+
+    In task queries, 'my tasks', 'tasks for me', and 'tasks assigned to me'
+    all mean tasks where the authenticated user is an assignee. Ownership or
+    task creation alone must not make a task part of this result.
+    """
     text = _normal_text(message)
-    return bool(re.search(r"\b(?:assigned|allocated|delegated)\s+to\s+me\b|\b(?:assigned|allocated|delegated)\s+me\b", text))
+    patterns = (
+        r"\b(?:assigned|allocated|delegated|given)\s+to\s+me\b",
+        r"\b(?:assigned|allocated|delegated|given)\s+me\b",
+        r"\bmy\s+(?:assigned\s+)?(?:tasks?|projects?|issues?|defects?|milestones?|task\s*lists?|time\s*logs?)\b",
+        r"\b(?:tasks?|projects?|issues?|defects?|milestones?|task\s*lists?|time\s*logs?)\s+(?:assigned|allocated|delegated|given)\s+to\s+me\b",
+        r"\b(?:tasks?|projects?|issues?)\s+for\s+me\b",
+        r"\bwhat\s+(?:are|is)\s+my\s+(?:tasks?|projects?|issues?)\b",
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _extract_requested_person(message: str) -> str | None:
+    """Extract a named person only when the query explicitly relates records to them.
+
+    This is used after the read tool returns its access-controlled records.
+    It intentionally does not treat generic all-record requests as person filters.
+    """
+    text = _normal_text(message)
+    patterns = (
+        # "tasks assigned to Prasanthi", "projects managed by Yasmin"
+        r"\b(?:assigned|allocated|delegated|given)\s+to\s+(?!me\b)([a-z][a-z .'-]*?)(?=\s+(?:and|with|in|under|for|from|whose|that|which)\b|[?.!,;]|$)",
+        r"\b(?:owned|created|managed|led)\s+by\s+([a-z][a-z .'-]*?)(?=\s+(?:and|with|in|under|for|from|whose|that|which)\b|[?.!,;]|$)",
+        # "Prasanthi's projects/tasks", "projects of Prasanthi", "tasks for Prasanthi"
+        r"\b([a-z][a-z .'-]*?)['’]s\s+(?:all\s+)?(?:projects?|tasks?|issues?|defects?|milestones?|task\s*lists?|time\s*logs?)\b",
+        r"\b(?:projects?|tasks?|issues?|defects?|milestones?|task\s*lists?|time\s*logs?)\s+(?:of|for|belonging\s+to)\s+([a-z][a-z .'-]*?)(?=[?.!,;]|$)",
+        r"\b(?:show|list|get|find)\s+(?:me\s+)?(?:the\s+)?(?:projects?|tasks?|issues?|defects?|milestones?|task\s*lists?|time\s*logs?)\s+(?:assigned\s+to|owned\s+by|created\s+by|managed\s+by)\s+([a-z][a-z .'-]*?)(?=[?.!,;]|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if not match:
+            continue
+        person = re.sub(r"\s+", " ", match.group(1)).strip(" .,'!?")
+        # Avoid accidentally interpreting common request words as a person's name.
+        if person and person not in {
+            "me", "myself", "all", "everyone", "anyone", "the team",
+            "the manager", "the owner", "the assignee", "current user",
+        }:
+            return person
+    return None
+
+
+
+
+def _extract_requested_project(message: str, messages: list[dict] | None = None) -> str | None:
+    """Extract a project name, resolving references such as 'this project' from chat context."""
+    text = _normal_text(message)
+    generic_reference = bool(re.search(r"\b(?:this|that|same|current)\s+project\b", text))
+
+    patterns = (
+        r"\b(?:inside|within|under|in)\s+(?:the\s+)?(?:project\s+)?(.+?)(?=\s+(?:with|where|whose|assigned|owned|having|and\s+with)\b|[?.!,;]|$)",
+        r"\b(?:tasks?|issues?|milestones?)\s+(?:inside|within|under|in|of)\s+(?:the\s+)?(?:project\s+)?(.+?)(?=[?.!,;]|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if not match:
+            continue
+        name = re.sub(r"\s+", " ", match.group(1)).strip(" .,'!?")
+        if name and name not in {"the project", "a project", "any project", "project", "this project", "that project", "same project", "current project"}:
+            return name
+
+    if generic_reference and messages:
+        # Prefer a project explicitly named in the user's earlier turns. An
+        # assistant response may list several projects and should not override
+        # the project the user was discussing.
+        for prior in reversed(messages):
+            if prior.get("role") != "user":
+                continue
+            prior_text = str(prior.get("content") or "")
+            if re.search(r"\b(?:inside|within|under|in|of)\b", prior_text, re.I):
+                prior_name = _extract_requested_project(prior_text, None)
+                if prior_name and prior_name not in {
+                    "the project", "a project", "any project", "project",
+                    "this project", "that project", "same project", "current project",
+                }:
+                    return prior_name
+
+        # Fallback: resolve from a specific assistant statement, but avoid
+        # interpreting a list of available projects as the current project.
+        for prior in reversed(messages):
+            if prior.get("role") != "assistant":
+                continue
+            content = str(prior.get("content") or "")
+            content = re.sub(r"<[^>]+>", " ", html.unescape(content))
+            candidates = re.findall(
+                r"(?:Project:\s*|inside\s+|within\s+|in\s+)([A-Za-z][A-Za-z0-9 _.-]*?)(?=\s*\(|\s*[—–,;.!?]|$)",
+                content,
+                flags=re.IGNORECASE,
+            )
+            for candidate in reversed(candidates):
+                candidate = re.sub(r"\s+", " ", candidate).strip(" .,'!?-—–")
+                if candidate and candidate.casefold() not in {"the project", "this project", "that project"}:
+                    return candidate
+    return None
+
+
+def _canonical_project_text(value) -> str:
+    """Normalize project names, including numeric suffixes such as 11 vs 011."""
+    text = _normal_text(value)
+    # Treat numeric tokens with leading zeroes as equivalent: "test 011" == "test 11".
+    text = re.sub(r"\d+", lambda match: str(int(match.group(0))), text)
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def _record_project_names(record) -> list[str]:
+    """Collect project names from common flat and nested task API shapes."""
+    if not isinstance(record, dict):
+        return []
+    candidates = []
+    for key in (
+        "project_name", "projectName", "project", "project_title",
+        "projectTitle", "project_display_name", "projectDisplayName",
+    ):
+        value = record.get(key)
+        if isinstance(value, dict):
+            for name_key in ("name", "project_name", "projectName", "title", "project_title"):
+                if value.get(name_key) not in (None, ""):
+                    candidates.append(str(value[name_key]))
+        elif isinstance(value, str):
+            candidates.append(value)
+    for key, value in _walk_values(record):
+        normalized_key = _normalize_field_name(key)
+        if normalized_key in {"project_name", "project_title", "project_display_name"} and isinstance(value, str):
+            candidates.append(value)
+    # De-duplicate while preserving the original order.
+    return list(dict.fromkeys(candidate.strip() for candidate in candidates if candidate.strip()))
+
+
+def _record_project_matches(record, requested_project: str) -> bool:
+    """Match by normalized project name; numeric suffix leading zeroes are ignored."""
+    wanted = _canonical_project_text(requested_project)
+    if not wanted:
+        return False
+    for candidate in _record_project_names(record):
+        actual = _canonical_project_text(candidate)
+        if actual and (actual == wanted or wanted in actual or actual in wanted):
+            return True
+    return False
+
+
+def _filter_records_by_project(payload, requested_project: str):
+    """Filter records by project; ask conversationally if no exact normalized match exists."""
+    records, parent, key = _extract_record_list(payload)
+    if records is None:
+        return payload, None
+
+    available_names = list(dict.fromkeys(
+        name for record in records for name in _record_project_names(record)
+    ))
+    filtered = [record for record in records if _record_project_matches(record, requested_project)]
+
+    if not filtered:
+        # Do not silently substitute a merely similar project. Preserve authorized
+        # project names so the final renderer can ask the user to clarify.
+        clarification = {
+            "clarification": (
+                f"I couldn't find tasks matching the project name '{requested_project}'. "
+                "Which project did you mean?"
+            ),
+            "requested_project": requested_project,
+            "available_projects": available_names[:8],
+            "filtered_count": 0,
+            "total_count": 0,
+            "has_more": False,
+        }
+        return clarification, 0
+
+    if parent is None:
+        return filtered, len(filtered)
+    parent[key] = filtered
+    if isinstance(payload, dict):
+        payload["filtered_count"] = len(filtered)
+        payload["total_count"] = len(filtered)
+        payload["has_more"] = len(filtered) > 5
+    for target in (parent, payload):
+        if not isinstance(target, dict):
+            continue
+        for count_key in (
+            "total", "total_count", "totalCount", "filtered_count", "filteredCount",
+            "count", "total_records", "totalRecords", "total_items", "totalItems",
+            "total_tasks", "totalTasks",
+        ):
+            if count_key in target and isinstance(target[count_key], (int, float)) and not isinstance(target[count_key], bool):
+                target[count_key] = len(filtered)
+        for more_key in ("has_more", "hasMore", "has_next", "hasNext"):
+            if more_key in target:
+                target[more_key] = len(filtered) > 5
+    return payload, len(filtered)
+
+
+def _update_filtered_count_metadata(payload, filtered_count: int):
+    """Keep pagination metadata aligned with the post-tool-filtered result set."""
+    records, parent, _ = _extract_record_list(payload)
+    targets = []
+    if isinstance(payload, dict):
+        targets.append(payload)
+    if isinstance(parent, dict) and parent is not payload:
+        targets.append(parent)
+    count_keys = (
+        "total", "total_count", "totalCount", "filtered_count", "filteredCount",
+        "count", "total_projects", "totalProjects", "projects_count", "projectsCount",
+        "total_tasks", "totalTasks", "total_records", "totalRecords",
+        "total_items", "totalItems",
+    )
+    for target in targets:
+        for key in count_keys:
+            if key in target and isinstance(target[key], (int, float)) and not isinstance(target[key], bool):
+                target[key] = filtered_count
+        if "has_more" in target:
+            target["has_more"] = filtered_count > 5
+        if "hasMore" in target:
+            target["hasMore"] = filtered_count > 5
+        if "has_next" in target:
+            target["has_next"] = filtered_count > 5
+        if "hasNext" in target:
+            target["hasNext"] = filtered_count > 5
+    if isinstance(payload, dict):
+        payload["filtered_count"] = filtered_count
+        payload["total_count"] = filtered_count
+        payload["has_more"] = filtered_count > 5
 
 
 # ============================================================
@@ -921,6 +1323,21 @@ async def llm_node(
                 synthetic_message
             ],
         }
+
+    # --------------------------------------------------------
+    # DETERMINISTIC LIST RESPONSE (NO NVIDIA ROUND-TRIP)
+    # --------------------------------------------------------
+
+    # Simple list requests can be rendered directly from authorized tool data.
+    # This guarantees the five-record + View More contract and avoids failing
+    # the whole list flow when NVIDIA rejects an otherwise successful tool call.
+    if has_tool_result and _is_simple_list_request(user_message):
+        fallback = _safe_html_fallback(messages, user_message)
+        if fallback:
+            return {
+                "messages": messages,
+                "final_response": fallback,
+            }
 
     # --------------------------------------------------------
     # NVIDIA
@@ -1263,6 +1680,28 @@ async def tool_node(
 
         elif tool_name in READ_TOOLS:
 
+            latest_user_message = next((
+                str(message.get("content") or "")
+                for message in reversed(messages)
+                if message.get("role") == "user"
+            ), "")
+
+            # Scope is determined from the user's wording for both projects and tasks:
+            #   "my ..." / "assigned to me" -> scope=mine
+            #   generic list or "all ..." -> scope=all
+            #   named-person request -> scope=all, then filter returned records locally
+            #     by the requested relationship (assignee by default; owner if explicit).
+            # The API still enforces the authenticated user's PMS authorization.
+            current_user_query = _wants_assigned_to_current_user(latest_user_message)
+            requested_person = _extract_requested_person(latest_user_message)
+            requested_project = _extract_requested_project(latest_user_message, messages)
+            unresolved_project_reference = bool(re.search(
+                r"\b(?:this|that|same|current)\s+project\b", _normal_text(latest_user_message)
+            )) and not requested_project
+            for post_tool_filter in ("person_name", "assignee_name", "owner_name"):
+                arguments.pop(post_tool_filter, None)
+            arguments["scope"] = "mine" if current_user_query else "all"
+
             try:
                 result = await tool_function(
                     state["access_token"],
@@ -1279,28 +1718,139 @@ async def tool_node(
                 )
                 raise
 
-            # Only the explicit phrase "assigned to me" applies the current-user
-            # filter. "What are my tasks/projects?" remains an unfiltered list request.
-            latest_user_message = next((
-                str(message.get("content") or "")
-                for message in reversed(messages)
-                if message.get("role") == "user"
-            ), "")
+            # Apply user/person filtering only AFTER the read tool has returned.
+            # If the user asked for all records, leave the authorized result intact.
             entity_meta = ENTITY_META.get(tool_name)
-            if entity_meta and _wants_assigned_to_current_user(latest_user_message):
-                entity_type = entity_meta[0]
-                try:
-                    current_user = await _current_user_details(state["access_token"])
-                    identities = _current_user_identity_values(current_user)
-                    if identities:
-                        result, filtered_count = _filter_records_for_current_user(result, entity_type, identities)
-                        logger.info("Applied current-user assignment filter (tool=%s, matched=%s)", tool_name, filtered_count)
+
+            # For project-specific questions, filter the projects collection too.
+            # Project records commonly use `name`/`title`, while task records use
+            # `project_name`; support both shapes and normalize leading zeroes.
+            if entity_meta and entity_meta[0] == "project" and requested_project:
+                project_records, project_parent, project_key = _extract_record_list(result)
+                if project_records is not None:
+                    wanted = _canonical_project_text(requested_project)
+                    def _project_record_matches(record):
+                        names = []
+                        if isinstance(record, dict):
+                            for field in ("name", "title", "project_name", "projectName", "project_title", "projectTitle"):
+                                value = record.get(field)
+                                if isinstance(value, str) and value.strip():
+                                    names.append(value)
+                        return any(
+                            _canonical_project_text(name) == wanted
+                            or wanted in _canonical_project_text(name)
+                            or _canonical_project_text(name) in wanted
+                            for name in names
+                            if _canonical_project_text(name)
+                        )
+                    matching_projects = [record for record in project_records if _project_record_matches(record)]
+                    if matching_projects:
+                        if project_parent is None:
+                            result = matching_projects
+                        else:
+                            project_parent[project_key] = matching_projects
+                            if isinstance(result, dict):
+                                result["filtered_count"] = len(matching_projects)
+                                result["total_count"] = len(matching_projects)
+                                result["has_more"] = False
                     else:
-                        logger.warning("Current-user identity returned no matchable values; refusing to claim assignment-filtered results")
-                        result = {"error": "Could not verify the current user's identity to filter assigned records."}
+                        available = []
+                        for record in project_records:
+                            if isinstance(record, dict):
+                                value = next((record.get(field) for field in ("name", "title", "project_name", "projectName") if record.get(field)), None)
+                                if value:
+                                    available.append(str(value))
+                        result = {
+                            "clarification": f"I couldn't find a project matching '{requested_project}'. Which project did you mean?",
+                            "requested_project": requested_project,
+                            "available_projects": available[:8],
+                            "filtered_count": 0,
+                            "total_count": 0,
+                            "has_more": False,
+                        }
+            if entity_meta and current_user_query and tool_name == "get_my_tasks":
+                # "My tasks" specifically means tasks assigned to the authenticated
+                # user. The tool call uses scope=mine, and this post-tool check ensures
+                # returned rows are actually associated through assignee fields rather
+                # than merely owned/created by the current user.
+                try:
+                    current_user = state.get("current_user")
+                    if current_user is None:
+                        current_user = await _current_user_details(state["access_token"])
+                    if not isinstance(current_user, (dict, list)):
+                        current_user = {
+                            "id": getattr(current_user, "id", None),
+                            "user_id": getattr(current_user, "user_id", None),
+                            "first_name": getattr(current_user, "first_name", None),
+                            "last_name": getattr(current_user, "last_name", None),
+                            "name": " ".join(filter(None, [
+                                getattr(current_user, "first_name", None),
+                                getattr(current_user, "last_name", None),
+                            ])).strip(),
+                            "username": getattr(current_user, "username", None),
+                            "email": getattr(current_user, "email", None),
+                        }
+                    current_user_identities = _current_user_identity_values(current_user)
+                    if not current_user_identities:
+                        raise ValueError("Authenticated user has no usable identity fields")
+                    result, filtered_count = _filter_records_for_current_user(
+                        result, "task", current_user_identities, include_owner=False
+                    )
+                    _update_filtered_count_metadata(result, filtered_count)
+                    logger.info(
+                        "Applied current-user assignee filter after tool result "
+                        "(tool=%s, matched=%s)", tool_name, filtered_count,
+                    )
                 except Exception:
-                    logger.exception("Could not fetch current-user details for assignment filter")
-                    result = {"error": "Could not verify the current user's identity to filter assigned records."}
+                    logger.exception("Could not verify current-user task assignees")
+                    result = {"error": "Could not verify tasks assigned to the authenticated user."}
+
+            elif entity_meta and requested_person:
+                entity_type = entity_meta[0]
+                person_identities = {_normal_text(requested_person)}
+                explicit_owner_query = bool(re.search(
+                    r"\b(?:owned by|owner is|whose owner is)\b",
+                    latest_user_message,
+                    re.IGNORECASE,
+                ))
+                # Task "assigned to X" means assignee only. Explicit owner queries
+                # use owner fields; project matching may use relevant project
+                # relationship fields returned by PMS.
+                include_owner = entity_type != "task" or explicit_owner_query
+                result, filtered_count = _filter_records_for_current_user(
+                    result, entity_type, person_identities, include_owner=include_owner
+                )
+                _update_filtered_count_metadata(result, filtered_count)
+                logger.info(
+                    "Applied post-tool named-person filter (tool=%s, person=%s, matched=%s)",
+                    tool_name, requested_person, filtered_count,
+                )
+
+            # A deictic reference such as 'this project' must resolve from chat history.
+            # If history doesn't identify a project, ask the user rather than showing
+            # unfiltered tasks or claiming that no tasks exist.
+            if entity_meta and unresolved_project_reference and entity_meta[0] in {"task", "issue", "milestone", "timelog"}:
+                available_records, _, _ = _extract_record_list(result)
+                available_projects = list(dict.fromkeys(
+                    name for record in (available_records or []) for name in _record_project_names(record)
+                ))
+                result = {
+                    "clarification": "Which project do you mean by 'this project'? Please tell me the project name.",
+                    "available_projects": available_projects[:8],
+                }
+
+            # Project-context filtering applies to task/issue/milestone records.
+            # It is performed after the authorized read tool returns and before
+            # the final-node five-record presentation limit.
+            elif entity_meta and requested_project and entity_meta[0] in {"task", "issue", "milestone", "timelog"}:
+                result, project_filtered_count = _filter_records_by_project(
+                    result, requested_project
+                )
+                if project_filtered_count is not None:
+                    logger.info(
+                        "Applied project filter (tool=%s, project=%s, matched=%s)",
+                        tool_name, requested_project, project_filtered_count,
+                    )
 
             # Avoid logging the complete result: task/project payloads may
             # contain confidential business data. Record only safe metadata.
@@ -1848,6 +2398,137 @@ STRICT_FINAL_OUTPUT_CONTRACT = (
 # FINAL NODE
 # ============================================================
 
+def _is_simple_list_request(user_message: str) -> bool:
+    """Identify straightforward entity-list requests that should use deterministic HTML."""
+    text = (user_message or "").strip().lower()
+    # "My projects" / "what are my projects" should use the same deterministic
+    # five-record + View More formatter even when the wording has no list verb.
+    asks_to_list = bool(re.search(
+        r"\b(?:show|list|get|display|give me|what are|what is|find|fetch)\b", text
+    )) or bool(re.search(
+        r"\bmy\s+(?:assigned\s+)?(?:tasks?|projects?|issues?|defects?|milestones?)\b",
+        text,
+    ))
+    asks_for_entity = bool(re.search(
+        r"\b(?:tasks?|projects?|issues?|defects?|milestones?|task\s*lists?|tasklists?|time\s*logs?|timesheets?)\b", text
+    ))
+    # Status/progress questions are entity-specific questions, not list requests.
+    # They must reach the deterministic status handler instead of being rendered
+    # as a project collection.
+    # Filtering qualifiers remain list requests unless the user asks for the
+    # status/progress itself.
+    detail_or_analysis = bool(re.search(
+        r"\b(?:why|how|compare|summari[sz]e|percentage|progress|status|completion|complete|completed|overall|details? of|explain|overdue|due date)\b", text
+    ))
+    return asks_to_list and asks_for_entity and not detail_or_analysis
+
+
+def _deterministic_project_status_response(messages, user_message):
+    """Answer a project-status follow-up from the filtered authorized project data."""
+    text = _normal_text(user_message)
+    if not re.search(r"\bstatus\b", text) or not re.search(r"\bproject\b", text):
+        return None
+
+    current_user_index = max(
+        (i for i, message in enumerate(messages) if message.get("role") == "user"),
+        default=-1,
+    )
+    turn = messages[current_user_index + 1:] if current_user_index >= 0 else messages
+    tool_names = {}
+    for message in turn:
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls", []) or []:
+                function = call.get("function", {}) or {}
+                tool_names[call.get("id")] = function.get("name")
+
+    for message in turn:
+        if message.get("role") != "tool" or tool_names.get(message.get("tool_call_id")) != "get_my_projects":
+            continue
+        try:
+            payload = json.loads(message.get("content") or "null")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and payload.get("clarification"):
+            question = html.escape(str(payload["clarification"]))
+            choices = payload.get("available_projects") or []
+            extra = ""
+            if choices:
+                extra = "<p>Available projects:</p><ul>" + "".join(
+                    f"<li>{html.escape(str(choice))}</li>" for choice in choices
+                ) + "</ul>"
+            return {"response_type": "chat", "response": f"<p>{question}</p>{extra}", "data": []}
+        records, _, _ = _extract_record_list(payload)
+        if not records:
+            continue
+        # Prefer the project resolved for this turn. Never silently report the
+        # first project if multiple candidate projects were returned.
+        valid_records = [record for record in records if isinstance(record, dict)]
+        if not valid_records:
+            continue
+
+        requested_project = _extract_requested_project(user_message, messages)
+        selected_record = None
+        if requested_project:
+            requested_key = _canonical_project_text(requested_project)
+            for candidate in valid_records:
+                if any(
+                    _canonical_project_text(candidate_name) == requested_key
+                    for candidate_name in _record_project_names(candidate)
+                ):
+                    selected_record = candidate
+                    break
+        if selected_record is None and len(valid_records) == 1:
+            selected_record = valid_records[0]
+        if selected_record is None:
+            choices = []
+            for candidate in valid_records[:5]:
+                candidate_name = next((candidate.get(k) for k in (
+                    "name", "project_name", "projectName", "title", "project_title"
+                ) if candidate.get(k)), None)
+                if candidate_name:
+                    choices.append(str(candidate_name))
+            if choices:
+                safe_choices = "".join(f"<li>{html.escape(choice)}</li>" for choice in choices)
+                return {
+                    "response_type": "chat",
+                    "response": "<p>Which project would you like the status for?</p><ul>" + safe_choices + "</ul>",
+                    "data": [],
+                }
+            continue
+
+        record = selected_record
+        name = next((record.get(k) for k in ("name", "project_name", "projectName", "title", "project_title") if record.get(k)), "the requested project")
+
+        # Status may be a string or a related master-data object, e.g.
+        # {"id": 43, "value": "Active", "label": "Active"}.
+        status = None
+        for status_key in ("status", "project_status", "projectStatus", "status_name", "statusName", "state"):
+            value = record.get(status_key)
+            if value in (None, ""):
+                continue
+            if isinstance(value, dict):
+                value = next((value.get(k) for k in (
+                    "value", "label", "name", "status_name", "statusName"
+                ) if value.get(k) not in (None, "")), None)
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                status = value
+                break
+
+        safe_name = html.escape(str(name))
+        if status is None:
+            return {
+                "response_type": "chat",
+                "response": f"<p>I found <strong>{safe_name}</strong>, but its status field wasn't included in the project data returned to me.</p>",
+                "data": [],
+            }
+        return {
+            "response_type": "chat",
+            "response": f"<p>The status of <strong>{safe_name}</strong> is <strong>{html.escape(str(status))}</strong>.</p>",
+            "data": [],
+        }
+    return None
+
+
 async def final_node(
     state: ChatState,
 ):
@@ -1903,6 +2584,14 @@ async def final_node(
             user_message_index + 1:
         ]
 
+    # Status follow-ups are not list requests. If the graph has project data
+    # for this turn, answer with the selected project's actual status instead
+    # of returning the full project list.
+    if any(message.get("role") == "tool" for message in current_turn_messages):
+        status_response = _deterministic_project_status_response(messages, user_message)
+        if status_response:
+            return {"final_response": status_response}
+
     final_messages = [
         {
             "role": "system",
@@ -1954,7 +2643,7 @@ async def final_node(
                     "MILESTONE = name + public_id (or id) + project ONLY.\n"
                     "TASKLIST = name + public_id (or id) + project ONLY.\n"
                     "3. Status, priority, completion, dates, owner, assignee, manager, delivery head, team, description, hours, billing, timestamps, and all other fields are FORBIDDEN by default. Add a field ONLY when the user explicitly asks for it.\n"
-                    "4. For list requests, show at most the 5 most recent records (prefer updated_at/created_at/date descending; if no date exists, preserve TOOL DATA order). Use exactly one <ol> with one <li> per displayed record. If more than 5 records exist, append a View more link to the entity collection route (projects=/projects, tasks=/tasks, issues=/issues, milestones=/milestones, tasklists=/tasklists, time logs=/time-log) and state how many are shown.\n"
+                    "4. For list requests, show at most the 5 most recent records (prefer updated_at/created_at/date descending; if no date exists, preserve TOOL DATA order). Use exactly one <ol> with one <li> per displayed record. If more than 5 records are available, append a View more link to the entity collection route (projects=/projects, tasks=/tasks, issues=/issues, milestones=/milestones, tasklists=/tasklists, time logs=/time-log). Do not state a total count or say 'showing 5 of N', because the returned count may not represent all records.\n"
                     "5. PRIMARY ENTITY NAVIGATION is mandatory whenever a reliable entity id exists. Use the graph-supplied navigation_url on the entity name.\n"
                     "6. For a task-list response, link only each task name to its own task navigation_url. Do not link project names or create project links from task records.\n"
                     "7. Never show raw URLs, raw JSON, tool names, internal metadata, or unrelated fields.\n"
@@ -2016,32 +2705,26 @@ async def final_node(
         len(tool_data),
     )
 
-    # TEMPORARY DEBUG PRINTS: inspect the exact PMS data being prepared for
-    # the final LLM request. Remove or disable these after debugging because
-    # tool results can contain internal/business information.
-    print("\n" + "=" * 90, flush=True)
-    print("[CHATBOT DEBUG] FINAL NODE INPUT", flush=True)
-    print("[CHATBOT DEBUG] User question:", repr(user_message), flush=True)
-    print("[CHATBOT DEBUG] Current-turn tool messages:", flush=True)
-    for tool_index, tool_message in enumerate(
-        [m for m in current_turn_messages if m.get("role") == "tool"],
-        start=1,
-    ):
-        print(f"\n[CHATBOT DEBUG] TOOL RESULT #{tool_index}", flush=True)
-        print(tool_message.get("content", "<no content>"), flush=True)
+    logger.debug(
+        "Prepared final-node input (query_length=%s, current_turn_tool_count=%s, tool_data_count=%s)",
+        len(user_message),
+        sum(1 for m in current_turn_messages if m.get("role") == "tool"),
+        len(tool_data) if isinstance(tool_data, list) else int(isinstance(tool_data, dict)),
+    )
 
-    print("\n[CHATBOT DEBUG] NAVIGATION-ENRICHED tool_data sent to final processing:", flush=True)
-    print(json.dumps(tool_data, indent=2, ensure_ascii=False, default=str), flush=True)
-
-    print("\n[CHATBOT DEBUG] Messages being sent to final NVIDIA call:", flush=True)
-    for message_index, final_message in enumerate(final_messages, start=1):
-        print(
-            f"\n--- FINAL MESSAGE #{message_index} | role={final_message.get('role')} ---",
-            flush=True,
-        )
-        print(final_message.get("content", "<no content>"), flush=True)
-
-    print("=" * 90 + "\n", flush=True)
+    # Deterministic list presentation: do not make the final list rendering
+    # depend on NVIDIA. This guarantees the 5-record limit and View More link
+    # even when the final NVIDIA request is rejected (for example HTTP 400).
+    # The read tools have already run and the fallback uses their current-turn
+    # authorized results and pagination/count metadata.
+    if _is_simple_list_request(user_message):
+        deterministic_list = _safe_html_fallback(messages, user_message)
+        if deterministic_list:
+            logger.info(
+                "Returning deterministic five-record list response (user_query=%r)",
+                user_message[:160],
+            )
+            return {"final_response": deterministic_list}
 
     final_messages.append(
         {
@@ -2119,6 +2802,14 @@ async def final_node(
             normalized_result.get("response", ""),
             tool_data,
         )
+
+        # Enforce the 5-record + View More contract even when NVIDIA returns a
+        # valid response containing too many records. The fallback uses the
+        # actual current-turn tool payload and authoritative count metadata.
+        if _is_simple_list_request(user_message):
+            deterministic_list = _safe_html_fallback(messages, user_message)
+            if deterministic_list:
+                normalized_result = deterministic_list
 
         if any(message.get("role") == "tool" for message in current_turn_messages):
             normalized_result["data"] = []

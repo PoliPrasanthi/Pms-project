@@ -31,9 +31,6 @@ class NVIDIAInvalidResponseError(NVIDIAClientError):
     """NVIDIA returned a response that could not be parsed as JSON."""
 
 
-# Keep a shared client so connections can be reused across requests.
-# If your application has an explicit lifespan/shutdown hook, close this
-# client there with: await nvidia_client.aclose()
 timeout = httpx.Timeout(
     connect=30.0,
     read=300.0,
@@ -43,11 +40,11 @@ timeout = httpx.Timeout(
 
 nvidia_client = httpx.AsyncClient(timeout=timeout)
 
-
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 MAX_ATTEMPTS = 3
 BASE_RETRY_DELAY_SECONDS = 2
 MAX_RETRY_DELAY_SECONDS = 30
+MAX_ERROR_BODY_LOG_CHARS = 1200
 
 
 def _retry_after_seconds(response: httpx.Response) -> float | None:
@@ -79,10 +76,25 @@ def _retry_delay(attempt: int, response: httpx.Response | None = None) -> float:
         if server_delay is not None:
             return server_delay
 
-    return min(
-        BASE_RETRY_DELAY_SECONDS ** attempt,
-        MAX_RETRY_DELAY_SECONDS,
-    )
+    return min(BASE_RETRY_DELAY_SECONDS ** attempt, MAX_RETRY_DELAY_SECONDS)
+
+
+def _safe_error_details(response: httpx.Response) -> str:
+    """Return a short provider error message for diagnostics, never request data."""
+    try:
+        body = response.text.strip()
+    except Exception:
+        return "<response body unavailable>"
+
+    if not body:
+        return "<empty response body>"
+
+    # Error bodies usually contain a provider-generated reason (invalid parameter,
+    # unsupported model option, context limit, etc.). Keep logs bounded.
+    body = " ".join(body.split())
+    if len(body) > MAX_ERROR_BODY_LOG_CHARS:
+        body = body[:MAX_ERROR_BODY_LOG_CHARS] + "... [truncated]"
+    return body
 
 
 async def chat_with_nvidia(
@@ -92,15 +104,7 @@ async def chat_with_nvidia(
     tool_choice: dict | str | None = None,
     max_tokens: int = 1024,
 ):
-    """Call NVIDIA chat completions with bounded retries and safe error logging.
-
-    Raises:
-        NVIDIAServiceUnavailableError: NVIDIA/network service remains unavailable
-            after retries.
-        NVIDIAAPIError: NVIDIA returns a non-retryable HTTP error.
-        NVIDIAInvalidResponseError: NVIDIA returns a successful HTTP status but
-            an invalid JSON body.
-    """
+    """Call NVIDIA chat completions with bounded retries and useful error logging."""
     payload = {
         "model": settings.NVIDIA_MODEL,
         "messages": messages,
@@ -112,7 +116,6 @@ async def chat_with_nvidia(
 
     if tools:
         payload["tools"] = tools
-        # Keep parallel tool calls disabled to preserve the existing behaviour.
         payload["parallel_tool_calls"] = False
         if tool_choice is not None:
             payload["tool_choice"] = tool_choice
@@ -126,7 +129,6 @@ async def chat_with_nvidia(
         "Content-Type": "application/json",
     }
 
-    # Validate that the payload can be serialized before making a network call.
     try:
         json.dumps(payload)
     except (TypeError, ValueError) as exc:
@@ -136,9 +138,13 @@ async def chat_with_nvidia(
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             logger.debug(
-                "Sending NVIDIA chat completion request (attempt %s/%s; max_tokens=%s)",
+                "Sending NVIDIA chat completion request (attempt %s/%s; model=%s; "
+                "json_mode=%s; tools=%s; max_tokens=%s)",
                 attempt,
                 MAX_ATTEMPTS,
+                settings.NVIDIA_MODEL,
+                json_mode,
+                bool(tools),
                 max_tokens,
             )
 
@@ -147,53 +153,53 @@ async def chat_with_nvidia(
                 headers=headers,
                 json=payload,
             )
-            response.raise_for_status()
+
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                status_code = exc.response.status_code
+                is_retryable = status_code in RETRYABLE_STATUS_CODES
+
+                logger.warning(
+                    "NVIDIA returned HTTP %s (attempt %s/%s; retryable=%s; "
+                    "content_type=%s; provider_error=%s)",
+                    status_code,
+                    attempt,
+                    MAX_ATTEMPTS,
+                    is_retryable,
+                    exc.response.headers.get("content-type", "unknown"),
+                    _safe_error_details(exc.response),
+                )
+
+                if is_retryable and attempt < MAX_ATTEMPTS:
+                    delay = _retry_delay(attempt, exc.response)
+                    logger.info("Retrying NVIDIA request in %.1f seconds", delay)
+                    await asyncio.sleep(delay)
+                    continue
+
+                if is_retryable:
+                    raise NVIDIAServiceUnavailableError(
+                        "The NVIDIA AI service is temporarily unavailable."
+                    ) from exc
+
+                raise NVIDIAAPIError(
+                    f"NVIDIA API request failed with HTTP {status_code}.",
+                    status_code=status_code,
+                ) from exc
 
             try:
                 return response.json()
             except (json.JSONDecodeError, ValueError) as exc:
-                # Do not log the entire response body; it may contain sensitive data.
                 logger.error(
-                    "NVIDIA returned a successful HTTP status but an invalid JSON response "
-                    "(status=%s)",
+                    "NVIDIA returned a successful HTTP status but an invalid JSON "
+                    "response (status=%s)",
                     response.status_code,
                 )
                 raise NVIDIAInvalidResponseError(
                     "The AI service returned an invalid response."
                 ) from exc
 
-        except httpx.HTTPStatusError as exc:
-            status_code = exc.response.status_code
-            is_retryable = status_code in RETRYABLE_STATUS_CODES
-
-            # Do not log authorization headers, request payloads, or full response bodies.
-            logger.warning(
-                "NVIDIA returned HTTP %s (attempt %s/%s; retryable=%s)",
-                status_code,
-                attempt,
-                MAX_ATTEMPTS,
-                is_retryable,
-            )
-
-            if is_retryable and attempt < MAX_ATTEMPTS:
-                delay = _retry_delay(attempt, exc.response)
-                logger.info("Retrying NVIDIA request in %.1f seconds", delay)
-                await asyncio.sleep(delay)
-                continue
-
-            if is_retryable:
-                raise NVIDIAServiceUnavailableError(
-                    "The NVIDIA AI service is temporarily unavailable."
-                ) from exc
-
-            # Authentication, invalid request, and other non-retryable HTTP errors.
-            raise NVIDIAAPIError(
-                f"NVIDIA API request failed with HTTP {status_code}.",
-                status_code=status_code,
-            ) from exc
-
         except httpx.RequestError as exc:
-            # Includes connection errors, read/write timeouts, protocol errors, etc.
             logger.warning(
                 "NVIDIA network request failed (attempt %s/%s; error_type=%s)",
                 attempt,
@@ -212,16 +218,12 @@ async def chat_with_nvidia(
             ) from exc
 
         except NVIDIAClientError:
-            # Preserve already-classified NVIDIA client errors without re-wrapping.
             raise
 
         except Exception:
-            # Unexpected programming/runtime errors should remain visible to the
-            # application-level exception handler; do not disguise them as outages.
             logger.exception("Unexpected error while calling NVIDIA API")
             raise
 
-    # Defensive fallback; the loop normally returns or raises above.
     raise NVIDIAServiceUnavailableError(
         "The NVIDIA AI service is temporarily unavailable."
     )

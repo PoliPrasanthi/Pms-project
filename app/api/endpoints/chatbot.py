@@ -284,6 +284,29 @@ async def get_chatbot_projects(
         status = project.get("status_master") or {}
         priority = project.get("priority_master") or {}
 
+        # billing_model may be a plain string (e.g. "T&M") or a master-data
+        # object/dict. Handle both shapes so project listing never fails with
+        # AttributeError when the API already returns the display value.
+        billing_model = project.get("billing_model")
+        if isinstance(billing_model, dict):
+            billing_type = (
+                billing_model.get("value")
+                or billing_model.get("display_name")
+                or billing_model.get("label")
+                or billing_model.get("name")
+            )
+        elif isinstance(billing_model, str):
+            billing_type = billing_model
+        elif billing_model is not None:
+            billing_type = (
+                getattr(billing_model, "value", None)
+                or getattr(billing_model, "display_name", None)
+                or getattr(billing_model, "label", None)
+                or getattr(billing_model, "name", None)
+            )
+        else:
+            billing_type = None
+
         formatted_team_members = [
             (member.get("user") or {}).get("display_name")
             or (member.get("user") or {}).get("name")
@@ -311,11 +334,14 @@ async def get_chatbot_projects(
             ),
             "team_members": formatted_team_members,
             "project_status": (
-                status.get("value")
+                status.get("display_name")
                 or status.get("label")
             ),
+            "project_completion_percentage": project.get(
+                "completion_percentage"
+            ),
             "priority": (
-                priority.get("value")
+                priority.get("display_name")
                 or priority.get("label")
             ),
             "description": project.get("description"),
@@ -325,18 +351,31 @@ async def get_chatbot_projects(
             "expected_end_date": project.get(
                 "expected_end_date"
             ),
-            "billing_type": project.get("billing_model"),
+            "billing_type": billing_type,
         })
+
+    # The formatter displays five projects in chat, so provide the exact
+    # number of projects remaining from the same filtered result set.
+    # This endpoint currently builds formatted_projects from all accessible
+    # matching records, making its length the authoritative total for this query.
+    total_project_count = len(formatted_projects)
+    has_more_projects = total_project_count > 5
 
     print(
         f"[PROJECT DEBUG] User ID: {current_user_id} | "
         f"Scope: {normalized_scope or 'default'} | "
         f"Fetched: {len(all_projects)} | "
-        f"Returned: {len(formatted_projects)}",
+        f"Returned: {total_project_count} | "
+        f"Total: {total_project_count} | "
+        f"Has more: {has_more_projects}",
         flush=True,
     )
 
-    return {"projects": formatted_projects}
+    return {
+        "projects": formatted_projects,
+        "total_count": total_project_count,
+        "has_more": has_more_projects,
+    }
 
 
 @router.get("/tasks")
@@ -357,7 +396,17 @@ async def get_chatbot_tasks(
     view_level = get_user_view_level(current_user, "task-view")
     service_user = current_user if view_level not in ("All", None) else None
 
-    # Fetch every page. The service applies its existing RBAC rules on each page.
+    # Always retrieve the complete authorized candidate set. The chatbot may
+    # display only five records initially, but display limits must never limit
+    # the records available for post-tool filtering or View More.
+    normalized_scope = (scope or "").strip().lower()
+    requested_task = (task_name or "").strip().lower()
+    requested_project = (project_name or "").strip().lower()
+    requested_public_id = (public_id or "").strip().lower()
+    requested_person = (person_name or "").strip().lower()
+    requested_status = (status or "").strip().lower()
+    requested_priority = (priority or "").strip().lower()
+
     all_tasks = []
     skip = 0
     batch_size = 100
@@ -371,7 +420,7 @@ async def get_chatbot_tasks(
             return_raw=True,
         )
         if isinstance(result, dict):
-            batch = result.get("items", [])
+            batch = result.get("items", []) or []
             total = result.get("total")
         else:
             batch = result or []
@@ -381,10 +430,13 @@ async def get_chatbot_tasks(
             break
         all_tasks.extend(batch)
         skip += len(batch)
+
         if total is not None and len(all_tasks) >= total:
             break
         if len(batch) < batch_size:
             break
+
+    total_task_count = len(all_tasks)
 
     current_user_id = getattr(current_user, "id", None)
 
@@ -405,14 +457,6 @@ async def get_chatbot_tasks(
 
     def same_id(a, b):
         return a is not None and b is not None and str(a) == str(b)
-
-    normalized_scope = (scope or "").strip().lower()
-    requested_task = (task_name or "").strip().lower()
-    requested_project = (project_name or "").strip().lower()
-    requested_public_id = (public_id or "").strip().lower()
-    requested_person = (person_name or "").strip().lower()
-    requested_status = (status or "").strip().lower()
-    requested_priority = (priority or "").strip().lower()
 
     formatted_tasks = []
     for task in all_tasks:
@@ -487,10 +531,17 @@ async def get_chatbot_tasks(
         })
 
     print(
-        f"[CHATBOT TASK DEBUG] User ID: {current_user_id} | Scope: {normalized_scope or 'default'} | Fetched: {len(all_tasks)} | Returned: {len(formatted_tasks)}",
+        f"[CHATBOT TASK DEBUG] User ID: {current_user_id} | Scope: {normalized_scope or 'default'} | Fetched: {len(all_tasks)} | Returned: {len(formatted_tasks)} | Total: {total_task_count}",
         flush=True,
     )
-    return {"tasks": formatted_tasks}
+    # Return every matching authorized task to the graph. The chat formatter
+    # controls the initial five-record display and View More navigation.
+    response_payload = {
+        "tasks": formatted_tasks,
+        "total_count": len(formatted_tasks),
+        "has_more": len(formatted_tasks) > 5,
+    }
+    return response_payload
 
 @router.get("/tasklists")
 async def get_chatbot_tasklists(
