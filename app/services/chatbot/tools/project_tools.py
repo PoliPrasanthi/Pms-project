@@ -105,7 +105,7 @@ async def get_current_user_details(
         )
 
         response.raise_for_status()
-
+        print(response.json())
         return response.json()
 
 async def get_my_permissions(
@@ -127,191 +127,49 @@ async def get_my_permissions(
         )
 
         response.raise_for_status()
-
+        print(response.json())
         return response.json()
     
-import time
-import httpx
-import logging
-
-logger = logging.getLogger(__name__)
-
-
-# Read filters accepted by the chatbot's read endpoints. These are query filters,
-# not permissions: the PMS backend must still enforce the authenticated user's access.
-READ_QUERY_KEYS = {
-    "scope", "project_name", "public_id", "person_name", "project_id",
-    "task_name", "tasklist_name", "issue_name", "milestone_name",
-    "status", "priority", "severity", "assignee_name", "owner_name",
-    "start_date", "end_date", "skip", "limit",
-}
-
-def _read_query_params(arguments: dict | None) -> dict:
-    if not isinstance(arguments, dict):
-        return {}
-    return {
-        key: value.strip() if isinstance(value, str) else value
-        for key, value in arguments.items()
-        if key in READ_QUERY_KEYS and value is not None and value != ""
-    }
-
-
-def _find_project_pagination_metadata(payload: dict) -> tuple[int | None, bool | None]:
-    """Find authoritative project pagination metadata across common API wrappers."""
-    total_keys = (
-        "total_count", "totalCount", "total", "total_projects", "totalProjects",
-        "projects_count", "projectsCount", "total_records", "totalRecords",
-    )
-    more_keys = ("has_more", "hasMore", "has_next", "hasNext", "next_page", "nextPage")
-
-    total = None
-    has_more = None
-    containers = [payload]
-    # Search common nested response/pagination wrappers without changing records.
-    for key in ("meta", "metadata", "pagination", "page_info", "pageInfo", "data"):
-        child = payload.get(key)
-        if isinstance(child, dict):
-            containers.append(child)
-            for nested_key in ("meta", "metadata", "pagination", "page_info", "pageInfo"):
-                nested = child.get(nested_key)
-                if isinstance(nested, dict):
-                    containers.append(nested)
-
-    for container in containers:
-        if total is None:
-            for key in total_keys:
-                value = container.get(key)
-                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                    total = value
-                    break
-                if isinstance(value, str) and value.strip().isdigit():
-                    total = int(value.strip())
-                    break
-        if has_more is None:
-            for key in more_keys:
-                value = container.get(key)
-                if isinstance(value, bool):
-                    has_more = value
-                    break
-                if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
-                    has_more = value.strip().lower() == "true"
-                    break
-        if total is not None and has_more is not None:
-            break
-
-    return total, has_more
-
-
 async def get_my_projects(
     access_token: str,
     arguments: dict | None = None,
 ):
-    """Fetch the first page of projects and normalize pagination metadata for View More."""
-    url = PMS_BASE_URL + PMS_MODULE_URL["projects_details"]
     headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Accept": "application/json",
+        "Authorization": f"Bearer {access_token}"
     }
 
-    query_params = _read_query_params(arguments)
-    query_params.setdefault("skip", 0)
-    query_params.setdefault("limit", 5)
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            PMS_BASE_URL + PMS_MODULE_URL["projects_details"],
+            headers=headers,
+            timeout=60.0,
+        )
 
-    start_time = time.perf_counter()
-    logger.info(
-        "[PROJECTS] Request started: url=%s, skip=%s, limit=%s",
-        url, query_params.get("skip"), query_params.get("limit"),
-    )
-    timeout = httpx.Timeout(connect=15.0, read=120.0, write=15.0, pool=15.0)
+        response.raise_for_status()
 
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.get(url, headers=headers, params=query_params)
-            elapsed = time.perf_counter() - start_time
-            logger.info(
-                "[PROJECTS] Response received: status=%s, elapsed=%.2fs",
-                response.status_code, elapsed,
-            )
-            response.raise_for_status()
-            result = response.json()
-
-            if isinstance(result, dict):
-                total, has_more = _find_project_pagination_metadata(result)
-                # The formatter expects these canonical keys. Only add them when
-                # the API actually supplied equivalent authoritative metadata.
-                if total is not None:
-                    result["total_count"] = total
-                if has_more is not None:
-                    result["has_more"] = has_more
-
-                records = next((result.get(key) for key in
-                                ("items", "results", "projects", "data", "records")
-                                if isinstance(result.get(key), list)), [])
-                logger.info(
-                    "[PROJECTS] Pagination metadata normalized: total_count=%s, "
-                    "has_more=%s, returned_records=%s, metadata_keys=%s",
-                    result.get("total_count"), result.get("has_more"), len(records),
-                    list(result.keys()),
-                )
-                if total is None and has_more is None:
-                    logger.warning(
-                        "[PROJECTS] API response has no recognized total/has-more metadata. "
-                        "The chatbot cannot show an accurate remaining-project count until "
-                        "the projects endpoint returns a total count."
-                    )
-            return result
-
-    except httpx.TimeoutException:
-        logger.exception("[PROJECTS] Request timed out after %.2f seconds", time.perf_counter() - start_time)
-        raise
-    except httpx.HTTPStatusError:
-        logger.exception("[PROJECTS] API returned an HTTP error")
-        raise
-    except httpx.RequestError:
-        logger.exception("[PROJECTS] Network error while requesting projects")
-        raise
+        print(response.json())
+        return response.json()
 
 
 async def get_my_tasks(
     access_token: str,
     arguments: dict | None = None,
 ):
-    """Fetch tasks with an explicit read timeout and useful diagnostics."""
     headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Accept": "application/json",
+        "Authorization": f"Bearer {access_token}"
     }
-    url = PMS_BASE_URL + PMS_MODULE_URL["task_details"]
-    # List answers only need the first five rows; the endpoint returns the
-    # authoritative total_count/has_more metadata for the View More link.
-    query_params = _read_query_params(arguments)
-    query_params.setdefault("skip", 0)
-    query_params.setdefault("limit", 5)
-    timeout = httpx.Timeout(
-        connect=15.0,
-        read=120.0,
-        write=15.0,
-        pool=15.0,
-    )
 
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.get(
-                url,
-                headers=headers,
-                params=query_params,
-            )
-            response.raise_for_status()
-            return response.json()
-    except httpx.TimeoutException:
-        logger.exception("[TASKS] Request timed out while calling %s", url)
-        raise
-    except httpx.HTTPStatusError:
-        logger.exception("[TASKS] PMS returned an HTTP error for %s", url)
-        raise
-    except httpx.RequestError:
-        logger.exception("[TASKS] Network error while calling %s", url)
-        raise
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            PMS_BASE_URL + PMS_MODULE_URL["task_details"],
+            headers=headers,
+            timeout=60.0,
+        )
+
+        response.raise_for_status()
+
+        print(response.json())
+        return response.json()
 
 
 async def get_my_tasklists(
@@ -326,12 +184,12 @@ async def get_my_tasklists(
         response = await client.get(
             PMS_BASE_URL + PMS_MODULE_URL["tasklists_details"],
             headers=headers,
-            params=_read_query_params(arguments),
             timeout=60.0,
         )
 
         response.raise_for_status()
 
+        print(response.json())
         return response.json()
 
 
@@ -347,12 +205,12 @@ async def get_my_issues(
         response = await client.get(
             PMS_BASE_URL + PMS_MODULE_URL["issues"],
             headers=headers,
-            params=_read_query_params(arguments),
             timeout=60.0,
         )
 
         response.raise_for_status()
 
+        print(response.json())              
         return response.json()
 
 
@@ -368,12 +226,11 @@ async def get_my_milestones(
         response = await client.get(
             PMS_BASE_URL + PMS_MODULE_URL["milestones"],
             headers=headers,
-            params=_read_query_params(arguments),
             timeout=60.0,
         )
 
         response.raise_for_status()
-
+        print(response.json())
         return response.json()
 
 
@@ -389,12 +246,12 @@ async def get_my_timelogs(
         response = await client.get(
             PMS_BASE_URL + PMS_MODULE_URL["timelogs"],
             headers=headers,
-            params=_read_query_params(arguments),
             timeout=60.0,
         )
 
         response.raise_for_status()
 
+        print(response.json())
         return response.json()
 
 async def create_task(

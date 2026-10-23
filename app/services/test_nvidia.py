@@ -1,54 +1,48 @@
 import asyncio
-import httpx
+import os
+import time
 
+from openai import AsyncOpenAI
 from app.core.config import settings
 
 
-async def test_nvidia():
+async def main():
+    print("Model:", settings.NVIDIA_MODEL)
+    print("API key configured:", bool(settings.NVIDIA_API_KEY))
 
-    url = settings.NVIDIA_URL
+    client = AsyncOpenAI(
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key=settings.NVIDIA_API_KEY,
+        timeout=90.0,
+        max_retries=0,
+    )
 
-    headers = {
-        "Authorization": f"Bearer {settings.NVIDIA_API_KEY}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
+    start = time.perf_counter()
 
-    payload = {
-        "model": settings.NVIDIA_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": "Hello. Reply with exactly: NVIDIA TEST SUCCESS"
-            }
-        ],
-        "temperature": 0.2,
-        "top_p": 0.95,
-        "max_tokens": 100,
-        "stream": False,
-    }
-
-    print("=" * 60)
-    print("NVIDIA BASIC TEST")
-    print("=" * 60)
-
-    print("URL:", url)
-    print("MODEL:", settings.NVIDIA_MODEL)
-
-    async with httpx.AsyncClient(timeout=120.0) as client:
-
-        response = await client.post(
-            url,
-            headers=headers,
-            json=payload,
+    try:
+        response = await client.chat.completions.create(
+            model="nvidia/nemotron-3-ultra-550b-a55b",
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Reply with exactly: Hello",
+                }
+            ],
+            max_tokens=20,
+            temperature=0.2,
         )
 
-        print("STATUS:", response.status_code)
-        print("RESPONSE:")
-        print(response.text)
+        print("Response time:", round(time.perf_counter() - start, 2), "seconds")
+        print("Response:", response.choices[0].message.content)
 
-        response.raise_for_status()
+    except Exception as exc:
+        print("Elapsed:", round(time.perf_counter() - start, 2), "seconds")
+        print("Error type:", type(exc).__name__)
+        print("Error:", str(exc)[:1500])
+
+    finally:
+        await client.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(test_nvidia())
+    asyncio.run(main())

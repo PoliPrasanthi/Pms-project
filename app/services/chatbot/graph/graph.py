@@ -273,10 +273,18 @@ def detect_read_tools(message: str) -> list[str]:
         r"\b(?:priority|priorities)\s+(?:of|for|on)\s+(?:my\s+)?tasks?\b",
     ))
 
+    # A named entity status question such as "what is the status of chatbot test 11"
+    # should search projects even when the user omits the word "project". Explicit
+    # task/issue/milestone wording still takes precedence and is not routed here.
+    implicit_project_status = bool(re.search(
+        r"\bstatus\s+(?:of|for)\s+(?!my\b|all\b|the\s+project\b)[a-z0-9][a-z0-9 _.-]*[a-z0-9]\s*[?.!]*$",
+        text,
+    )) and not has((r"\btasks?\b", r"\bissues?\b", r"\bdefects?\b", r"\bmilestones?\b"))
+
     wants_projects = has((
         r"\bprojects?\b",
         r"\bproject\s+(?:status|manager|owner|team|members|priority|details?)\b",
-    ))
+    )) or implicit_project_status
 
     wants_issues = has((
         r"\bissues?\b",
@@ -440,21 +448,73 @@ def _normal_text(value):
 
 
 def _identity_matches(candidate, identities):
-    """Match exact IDs/names, or a requested first/last name within a full name."""
+    """Match IDs exactly and person names by token or >=90% similarity.
+
+    This supports a short query such as "Prasanthi" matching the stored full
+    name "Poli Prasanthi", and small spelling differences in person names.
+    Numeric IDs remain exact-only so fuzzy matching cannot cross-match records.
+    """
     candidate_text = _normal_text(candidate)
     if not candidate_text:
         return False
-    normalized_identities = {_normal_text(value) for value in identities if _normal_text(value)}
+
+    def name_form(value):
+        # Ignore punctuation and repeated whitespace for display-name comparison.
+        return " ".join(re.findall(r"[a-z0-9]+", _normal_text(value)))
+
+    normalized_identities = {
+        _normal_text(value) for value in identities if _normal_text(value)
+    }
     if candidate_text in normalized_identities:
         return True
 
-    # Name-only partial matching lets a query such as 'Rohini' match the returned
-    # full name 'Rohini Senthil Kumar'. Keep numeric IDs exact to avoid ID collisions.
-    if not candidate_text.isdigit():
-        candidate_tokens = set(re.findall(r"[a-z0-9@._+-]+", candidate_text))
-        for identity in normalized_identities:
-            if not identity.isdigit() and identity in candidate_tokens:
-                return True
+    if candidate_text.isdigit():
+        return False
+
+    candidate_name = name_form(candidate_text)
+    candidate_tokens = set(candidate_name.split())
+
+    for identity in normalized_identities:
+        # Never use fuzzy matching for numeric IDs.
+        if identity.isdigit():
+            continue
+        identity_name = name_form(identity)
+        if not identity_name:
+            continue
+
+        # A first/last name token matches a full display name, e.g.
+        # "Prasanthi" -> "Poli Prasanthi".
+        if identity_name in candidate_tokens or candidate_name in set(identity_name.split()):
+            return True
+
+        # Also allow a full-name substring, but only on word boundaries.
+        if re.search(rf"(?<![a-z0-9]){re.escape(identity_name)}(?![a-z0-9])", candidate_name):
+            return True
+
+        # Allow a short/partial person name to match a longer stored display
+        # name, including common spelling variants such as "Prashanthi" vs
+        # "Prasanthi". Keep the fuzzy threshold conservative and require at
+        # least 5 characters for token-level fuzzy matching to avoid matching
+        # short, ambiguous names.
+        if SequenceMatcher(None, candidate_name, identity_name).ratio() >= 0.82:
+            return True
+        identity_tokens = identity_name.split()
+        if any(
+            len(candidate_name) >= 5
+            and len(token) >= 5
+            and SequenceMatcher(None, candidate_name, token).ratio() >= 0.78
+            for token in identity_tokens
+        ):
+            return True
+        if any(
+            len(candidate_token) >= 5
+            and len(token) >= 5
+            and SequenceMatcher(None, candidate_token, token).ratio() >= 0.78
+            for candidate_token in candidate_tokens
+            for token in identity_tokens
+        ):
+            return True
+
     return False
 
 
@@ -510,7 +570,7 @@ def _record_assignment_matches(record, entity_type, identities, include_owner=Fa
     if not isinstance(record, dict) or not identities:
         return False
     common = {
-        "task": {"assignee", "assignees", "assignee_name", "assignee_names", "assignee_id", "assignee_ids", "assignee_email", "assignee_emails", "assigned_to", "assigned_to_id", "assigned_to_name", "assigned_user", "assigned_users", "task_owner", "task_owners", "task_owner_name", "task_owner_names", "task_owner_id", "task_owner_ids", "user"},
+        "task": {"assignee", "assignees", "assignee_name", "assignee_names", "assignee_id", "assignee_ids", "assignee_email", "assignee_emails", "assigned_to", "assigned_to_id", "assigned_to_name", "assigned_user", "assigned_users", "task_owner", "task_owners", "task_owner_name", "task_owner_names", "task_owner_full_name", "task_owner_display_name", "task_owner_id", "task_owner_ids", "assignee_full_name", "assignee_display_name", "assigned_to_display_name", "user"},
         "issue": {"assignee", "assignees", "assignee_name", "assignee_id", "assignee_email", "assignee_emails", "assigned_to", "assigned_to_id", "assigned_user", "reporter", "reporter_name", "created_by"},
         # For "my projects" / "projects assigned to me", membership means
         # the authenticated user appears in the project team-member data.
@@ -626,6 +686,433 @@ def _record_date(record):
     return ""
 
 
+
+
+# ============================================================
+# DETERMINISTIC FIELD/VALUE FILTERING
+# ============================================================
+
+_STATUS_VALUES = (
+    "in progress", "inprogress", "in_progress", "in-progress",
+    "completed", "complete", "closed", "open", "active", "inactive",
+    "pending", "on hold", "onhold", "on_hold", "planning", "planned",
+    "to do", "todo", "new", "blocked", "resolved", "reopened",
+    "cancelled", "canceled", "overdue", "in review", "inreview",
+)
+_PRIORITY_VALUES = ("critical", "urgent", "highest", "high", "medium", "normal", "low", "lowest")
+
+_FILTER_FIELD_ALIASES = {
+    "status": (
+        "status", "status_name", "statusName", "task_status", "taskStatus",
+        "project_status", "projectStatus", "issue_status", "issueStatus",
+        "state", "state_name", "stateName",
+    ),
+    "priority": (
+        "priority", "priority_name", "priorityName", "priority_label",
+        "priorityLabel", "task_priority", "taskPriority", "project_priority",
+        "projectPriority", "severity", "severity_name", "severityName",
+    ),
+    "billing model": ("billing_model", "billingModel", "billing_type", "billingType", "billing"),
+    "project type": ("project_type", "projectType", "type", "type_name", "typeName"),
+    "completion": (
+        "completion", "completion_percentage", "completionPercentage", "progress",
+        "progress_percentage", "progressPercentage", "percent_complete", "percentComplete",
+    ),
+    "due date": ("due_date", "dueDate", "deadline", "expected_end_date", "expectedEndDate", "end_date", "endDate", "target_date", "targetDate"),
+    "start date": ("start_date", "startDate", "planned_start_date", "plannedStartDate", "expected_start_date", "expectedStartDate"),
+    "created date": ("created_at", "createdAt", "created_date", "createdDate", "creation_date", "creationDate"),
+    "updated date": ("updated_at", "updatedAt", "modified_at", "modifiedAt", "updated_date", "updatedDate"),
+    "owner": ("owner", "owner_name", "ownerName", "task_owner", "task_owner_name", "taskOwner", "taskOwnerName", "project_owner", "projectOwner"),
+    "assignee": ("assignee", "assignees", "assignee_name", "assigneeName", "assigned_to", "assignedTo", "assigned_user", "assignedUser", "assigned_users", "assignedUsers"),
+    "manager": ("manager", "manager_name", "managerName", "project_manager", "projectManager", "project_manager_name", "projectManagerName"),
+    "severity": ("severity", "severity_name", "severityName"),
+}
+
+_FILTER_DISPLAY_LABELS = {
+    "status": "Status",
+    "priority": "Priority",
+    "billing model": "Billing Model",
+    "project type": "Project Type",
+    "completion": "Completion",
+    "due date": "Due Date",
+    "start date": "Start Date",
+    "created date": "Created Date",
+    "updated date": "Updated Date",
+    "owner": "Owner",
+    "assignee": "Assignee",
+    "manager": "Manager",
+    "severity": "Severity",
+}
+
+
+def _canonical_filter_value(value):
+    """Normalize label values so 'In Progress', 'inprogress' and 'IN_PROGRESS' match."""
+    if isinstance(value, dict):
+        value = next((value.get(k) for k in (
+            "label", "name", "value", "display_name", "displayName",
+            "status_name", "statusName", "priority_name", "priorityName",
+        ) if value.get(k) not in (None, "")), None)
+    if isinstance(value, list):
+        return [_canonical_filter_value(item) for item in value]
+    if value is None:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "", str(value).casefold())
+
+
+def _detect_attribute_filter(user_message):
+    """Recognize common field=value filters in natural language.
+
+    Only explicit field/value requests are returned. Sorting requests are never
+    interpreted as filters (e.g. 'sort by priority').
+    """
+    text = _normal_text(user_message)
+    if not text or _detect_sort_request(text):
+        return None
+
+    # Match known status values first, longest first, including no-space variants.
+    status_values = sorted(_STATUS_VALUES, key=len, reverse=True)
+    status_alt = "|".join(re.escape(v).replace(r"\ ", r"[\s_-]*") for v in status_values)
+    status_patterns = (
+        rf"\b(?:status|state)\s*(?:is|as|=|equals?|equal\s+to|of)?\s*({status_alt})\b",
+        rf"\b(?:with|whose|having)\s+(?:a\s+)?(?:status|state)\s*(?:is|as|=)?\s*({status_alt})\b",
+    )
+    for pattern in status_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return {"field": "status", "value": match.group(1), "operator": "equals"}
+
+    priority_alt = "|".join(re.escape(v) for v in sorted(_PRIORITY_VALUES, key=len, reverse=True))
+    priority_patterns = (
+        # "priority medium", "priority is medium", "priority as medium"
+        rf"\bpriority\s*(?:is|as|=|equals?|equal\s+to)?\s*({priority_alt})\b",
+        # "medium priority" and the common conversational form "medium as priority"
+        rf"\b({priority_alt})\s+(?:as\s+)?priority\b",
+    )
+    for pattern in priority_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return {"field": "priority", "value": match.group(1), "operator": "equals"}
+
+    # Common explicit field/value forms beyond status and priority.
+    generic_fields = {
+        "billing model": r"\b(?:billing\s+model|billing\s+type|billing)\b",
+        "project type": r"\bproject\s+type\b",
+    }
+    for field, field_pattern in generic_fields.items():
+        match = re.search(
+            field_pattern + r"\s*(?:is|as|=|equals?|equal\s+to)\s*([a-z0-9][a-z0-9 &/_-]*?)(?=\s+\b(?:and|or|with|where|whose|having|sort|order)\b|[?.!,;]|$)",
+            text,
+            re.IGNORECASE,
+        )
+        if match:
+            value = match.group(1).strip(" _-/")
+            if value:
+                return {"field": field, "value": value, "operator": "equals"}
+
+    # Date comparisons: due date before/after a specific date.
+    date_filter = re.search(
+        r"\b(due\s+date|deadline|start\s+date|created\s+date|updated\s+date)\s*"
+        r"(before|after|on|is|=)\s*(\d{4}-\d{2}-\d{2})\b",
+        text,
+        re.IGNORECASE,
+    )
+    if date_filter:
+        field_text, op_text, date_value = date_filter.groups()
+        field_text = re.sub(r"\s+", " ", field_text.casefold())
+        field = "due date" if field_text == "deadline" else field_text
+        operator = {"before": "lt", "after": "gt", "on": "eq", "is": "eq", "=": "eq"}[op_text.casefold()]
+        return {"field": field, "value": date_value, "operator": operator}
+
+    # Explicit equality filters for common fields. This allows the same
+    # field=value workflow to cover dates, owners, assignees, managers, and
+    # other record attributes, not only status/priority.
+    generic_field_patterns = (
+        ("due date", r"\b(?:due\s+date|deadline)\b"),
+        ("start date", r"\bstart\s+date\b"),
+        ("created date", r"\bcreated\s+date\b"),
+        ("updated date", r"\bupdated\s+date\b"),
+        ("owner", r"\b(?:task\s+owner|project\s+owner|owner)\b"),
+        ("assignee", r"\b(?:assignee|assigned\s+user)\b"),
+        ("manager", r"\b(?:project\s+manager|manager)\b"),
+        ("severity", r"\bseverity\b"),
+    )
+    for field, field_pattern in generic_field_patterns:
+        match = re.search(
+            field_pattern + r"\s*(?:is|as|=|equals?|equal\s+to)\s*"
+            r"([a-z0-9][a-z0-9 @._/-]*?)(?=\s+\b(?:and|or|with|where|whose|having|sort|order)\b|[?.!,;]|$)",
+            text,
+            re.IGNORECASE,
+        )
+        if match:
+            value = match.group(1).strip(" _-/")
+            if value:
+                return {"field": field, "value": value, "operator": "equals"}
+
+    # Numeric completion/progress filters: e.g. completion above 50%.
+    progress = re.search(
+        r"\b(?:completion|progress)\s*(above|over|greater\s+than|more\s+than|at\s+least|below|under|less\s+than|at\s+most|=|is)\s*(\d+(?:\.\d+)?)\s*%?",
+        text,
+        re.IGNORECASE,
+    )
+    if progress:
+        op_text, number = progress.groups()
+        op_text = re.sub(r"\s+", " ", op_text.casefold())
+        operator = {
+            "above": "gt", "over": "gt", "greater than": "gt", "more than": "gt",
+            "at least": "gte", "below": "lt", "under": "lt", "less than": "lt",
+            "at most": "lte", "=": "eq", "is": "eq",
+        }[op_text]
+        return {"field": "completion", "value": float(number), "operator": operator}
+
+    return None
+
+
+def _field_values_for_record(record, field):
+    """Extract real field values from flat or nested API records."""
+    if not isinstance(record, dict):
+        return []
+    aliases = {_normalize_field_name(k) for k in _FILTER_FIELD_ALIASES.get(field, ())}
+    found = []
+
+    # Prefer direct entity fields. For task records, do not accidentally read
+    # status/priority from the nested parent project.
+    for key, value in record.items():
+        normalized = _normalize_field_name(key)
+        if normalized in aliases and value not in (None, ""):
+            found.append(value)
+
+    def walk(value, inside_project=False):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                normalized = _normalize_field_name(key)
+                project_context = inside_project or normalized in {
+                    "project", "project_details", "project_record", "parent_project"
+                }
+                if normalized in aliases and child not in (None, "") and not project_context:
+                    found.append(child)
+                if isinstance(child, (dict, list)):
+                    walk(child, project_context)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item, inside_project)
+
+    walk(record)
+    # De-duplicate by canonical representation.
+    unique = []
+    seen = set()
+    for value in found:
+        canonical = _canonical_filter_value(value)
+        if canonical and canonical not in seen:
+            seen.add(canonical)
+            unique.append(value)
+    return unique
+
+
+def _record_matches_attribute_filter(record, filter_spec):
+    field = filter_spec["field"]
+    wanted = filter_spec["value"]
+    operator = filter_spec.get("operator", "equals")
+    values = _field_values_for_record(record, field)
+    if not values:
+        return False
+    if field == "completion":
+        try:
+            target = float(wanted)
+        except (TypeError, ValueError):
+            return False
+        for raw in values:
+            if isinstance(raw, dict):
+                raw = next((raw.get(k) for k in ("value", "label", "name", "percentage") if raw.get(k) not in (None, "")), None)
+            match = re.search(r"-?\d+(?:\.\d+)?", str(raw or "").replace(",", ""))
+            if not match:
+                continue
+            actual = float(match.group())
+            if (
+                (operator == "gt" and actual > target)
+                or (operator == "gte" and actual >= target)
+                or (operator == "lt" and actual < target)
+                or (operator == "lte" and actual <= target)
+                or (operator == "eq" and actual == target)
+            ):
+                return True
+        return False
+    if field in {"due date", "start date", "created date", "updated date"} and operator in {"gt", "lt", "eq"}:
+        target_date = str(wanted)[:10]
+        for raw in values:
+            actual_date = _display_field_value(raw)[:10]
+            if not actual_date:
+                continue
+            if (
+                (operator == "gt" and actual_date > target_date)
+                or (operator == "lt" and actual_date < target_date)
+                or (operator == "eq" and actual_date == target_date)
+            ):
+                return True
+        return False
+    wanted_normalized = _canonical_filter_value(wanted)
+    return any(_canonical_filter_value(value) == wanted_normalized for value in values)
+
+
+def _apply_attribute_filter_to_messages(messages, user_message):
+    """Filter current-turn authorized tool payloads before LLM or HTML rendering."""
+    filter_spec = _detect_attribute_filter(user_message)
+    if not filter_spec:
+        return messages, None, False
+
+    # Determine the requested entity from the query so unrelated tool payloads
+    # are not modified if multiple read tools were called.
+    text = _normal_text(user_message)
+    entity_patterns = (
+        ("tasklist", r"\btask\s*lists?\b|\btasklists?\b"),
+        ("task", r"\btasks?\b"),
+        ("project", r"\bprojects?\b"),
+        ("issue", r"\bissues?\b|\bdefects?\b"),
+        ("milestone", r"\bmilestones?\b"),
+        ("timelog", r"\btime\s*logs?\b|\btimesheets?\b|\btime\s*entries\b"),
+    )
+    requested_entity = next((entity for entity, pattern in entity_patterns if re.search(pattern, text)), None)
+    tool_to_entity = {
+        "get_my_projects": "project", "get_my_tasks": "task",
+        "get_my_issues": "issue", "get_my_milestones": "milestone",
+        "get_my_tasklists": "tasklist", "get_my_timelogs": "timelog",
+    }
+    if requested_entity is None:
+        return messages, filter_spec, False
+
+    # Map current-turn tool call IDs to the actual tool names.
+    current_user_index = max(
+        (i for i, message in enumerate(messages) if message.get("role") == "user"),
+        default=-1,
+    )
+    turn_start = current_user_index + 1 if current_user_index >= 0 else 0
+    turn = messages[turn_start:]
+    tool_names = {}
+    for message in turn:
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls", []) or []:
+                function = call.get("function", {}) or {}
+                tool_names[call.get("id")] = function.get("name")
+
+    updated_messages = [dict(message) for message in messages]
+    applied = False
+    for idx in range(turn_start, len(updated_messages)):
+        message = updated_messages[idx]
+        if message.get("role") != "tool":
+            continue
+        tool_name = tool_names.get(message.get("tool_call_id")) or message.get("name") or message.get("tool_name")
+        if tool_to_entity.get(tool_name) != requested_entity:
+            continue
+        try:
+            payload = json.loads(message.get("content") or "null")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        records, parent, key = _extract_record_list(payload)
+        if records is None:
+            continue
+
+        valid_records = [record for record in records if isinstance(record, dict)]
+        original_record_count = len(valid_records)
+        # A result is considered complete when the API's authoritative total
+        # equals the returned record count, or when no total is provided and
+        # the tool returned more than the normal five-record display limit.
+        original_total = None
+        count_keys_for_read = (
+            "total", "total_count", "totalCount", "count", "total_records",
+            "totalRecords", "total_items", "totalItems", "total_projects",
+            "totalProjects", "total_tasks", "totalTasks",
+        )
+        for source in (parent, payload):
+            if isinstance(source, dict):
+                for count_key in count_keys_for_read:
+                    count_value = source.get(count_key)
+                    if isinstance(count_value, int) and not isinstance(count_value, bool) and count_value >= 0:
+                        original_total = count_value
+                        break
+            if original_total is not None:
+                break
+        complete_candidate_set = (
+            (original_total is not None and original_total == original_record_count)
+            or (original_total is None and original_record_count > 5)
+        )
+
+        values_present = any(_field_values_for_record(record, filter_spec["field"]) for record in valid_records)
+        filtered_records = [
+            record for record in valid_records
+            if _record_matches_attribute_filter(record, filter_spec)
+        ]
+
+        if not values_present and valid_records:
+            if isinstance(payload, dict):
+                payload["_chatbot_filter_error"] = (
+                    f"The {filter_spec['field']} field was not present in the authorized {requested_entity} records."
+                )
+                # Never show unfiltered data when the requested field cannot be verified.
+                if parent is None:
+                    payload = {"items": [], "_chatbot_filter_error": (
+                        f"The {filter_spec['field']} field was not present in the authorized {requested_entity} records."
+                    )}
+                else:
+                    parent[key] = []
+        else:
+            if parent is None:
+                payload = filtered_records
+            else:
+                parent[key] = filtered_records
+
+        # Keep counts tied to matching records. If the API returned the complete
+        # candidate set, filtered count is authoritative. If the API returned only
+        # one page of a larger dataset, do not invent a global filtered total.
+        metadata_sources = [payload]
+        if isinstance(parent, dict):
+            metadata_sources.insert(0, parent)
+        count_keys = {
+            "total", "total_count", "totalCount", "count", "total_records",
+            "totalRecords", "total_items", "totalItems", "total_projects",
+            "totalProjects", "total_tasks", "totalTasks", "project_count",
+            "projectCount", "task_count", "taskCount",
+        }
+        if isinstance(payload, dict):
+            payload["filtered_count"] = len(filtered_records)
+        for source in metadata_sources:
+            if not isinstance(source, dict):
+                continue
+            if complete_candidate_set:
+                for count_key in count_keys:
+                    if count_key in source and isinstance(source[count_key], (int, float)):
+                        source[count_key] = len(filtered_records)
+                for more_key in ("has_more", "hasMore", "has_next", "hasNext"):
+                    if more_key in source:
+                        source[more_key] = len(filtered_records) > 5
+            else:
+                # The API page is incomplete: its total describes unfiltered data.
+                # Remove that total so the renderer will use a plain View More link
+                # rather than show a false remaining-match count.
+                for count_key in count_keys:
+                    source.pop(count_key, None)
+        message["content"] = json.dumps(payload, ensure_ascii=False, default=str)
+        applied = True
+        logger.info(
+            "Applied deterministic PMS field filter (entity=%s field=%s value=%r input=%s output=%s)",
+            requested_entity, filter_spec["field"], filter_spec["value"],
+            len(valid_records), len(filtered_records),
+        )
+
+    return updated_messages, filter_spec, applied
+
+
+
+
+def _display_field_value(value):
+    if isinstance(value, dict):
+        value = next((value.get(k) for k in (
+            "label", "name", "value", "display_name", "displayName",
+            "status_name", "statusName", "priority_name", "priorityName",
+        ) if value.get(k) not in (None, "")), None)
+    if isinstance(value, list):
+        return ", ".join(str(_display_field_value(item)) for item in value if item not in (None, ""))
+    return "" if value is None else str(value)
+
+
 def _safe_html_fallback(messages, user_message=""):
     """Render authorized current-turn tool results if final LLM formatting fails.
 
@@ -649,12 +1136,14 @@ def _safe_html_fallback(messages, user_message=""):
 
     chunks = []
     seen_entities = set()
+    filter_spec = _detect_attribute_filter(user_message)
+    sort_spec = _detect_sort_request(user_message)
 
     for message in turn:
         if message.get("role") != "tool":
             continue
 
-        tool_name = tool_names.get(message.get("tool_call_id"))
+        tool_name = tool_names.get(message.get("tool_call_id")) or message.get("name") or message.get("tool_name")
         meta = ENTITY_META.get(tool_name)
         if not meta:
             continue
@@ -667,6 +1156,13 @@ def _safe_html_fallback(messages, user_message=""):
         try:
             payload = json.loads(message.get("content") or "null")
         except (TypeError, json.JSONDecodeError):
+            continue
+
+        if isinstance(payload, dict) and payload.get("_chatbot_filter_error"):
+            chunks.append(
+                f"<p>I couldn't apply the requested filter because "
+                f"{html.escape(str(payload.get('_chatbot_filter_error')))}</p>"
+            )
             continue
 
         if isinstance(payload, dict) and payload.get("error"):
@@ -690,6 +1186,90 @@ def _safe_html_fallback(messages, user_message=""):
         if records is None:
             continue
 
+        # DEFENSIVE NAMED-PERSON FILTER: never let the LLM decide whether a
+        # requested person's tasks exist. The read tool may return authorized
+        # records correctly while the final LLM still hallucinates an empty set.
+        # Match names against assignee fields using the same token/fuzzy matcher
+        # used by the post-tool filter (e.g. "prashanthi" -> "Poli Prasanthi").
+        requested_person = _extract_requested_person(user_message)
+        person_filter_applies = False
+        if requested_person:
+            query_text = _normal_text(user_message)
+            requested_entity_for_person = None
+            for candidate_entity, pattern in (
+                ("tasklist", r"\btask\s*lists?\b|\btasklists?\b"),
+                ("task", r"\btasks?\b"),
+                ("project", r"\bprojects?\b"),
+                ("issue", r"\bissues?\b|\bdefects?\b"),
+                ("milestone", r"\bmilestones?\b"),
+                ("timelog", r"\btime\s*logs?\b|\btimesheets?\b|\btime\s*entries\b"),
+            ):
+                if re.search(pattern, query_text):
+                    requested_entity_for_person = candidate_entity
+                    break
+
+            if requested_entity_for_person and requested_entity_for_person == entity_type:
+                explicit_owner_query = bool(re.search(
+                    r"\b(?:owned by|owner is|whose owner is)\b",
+                    query_text,
+                ))
+                include_owner = entity_type != "task" or explicit_owner_query
+                person_identities = {_normal_text(requested_person)}
+                records = [
+                    record for record in records
+                    if isinstance(record, dict) and _record_assignment_matches(
+                        record, entity_type, person_identities, include_owner=include_owner
+                    )
+                ]
+                person_filter_applies = True
+                logger.info(
+                    "Applied deterministic final named-person filter "
+                    "(entity=%s, person=%s, matched=%s)",
+                    entity_type, requested_person, len(records),
+                )
+
+        # DEFENSIVE FILTER: filter the records again at the final HTML boundary.
+        # This prevents an unfiltered LLM/tool response from leaking into the
+        # visible answer if an earlier message-rewrite step could not identify
+        # the tool-call ID. Do not trust the LLM to perform a requested filter.
+        filter_applies_to_entity = False
+        filter_error = None
+        if filter_spec:
+            query_text = _normal_text(user_message)
+            requested_entity = None
+            for candidate_entity, pattern in (
+                ("tasklist", r"\btask\s*lists?\b|\btasklists?\b"),
+                ("task", r"\btasks?\b"),
+                ("project", r"\bprojects?\b"),
+                ("issue", r"\bissues?\b|\bdefects?\b"),
+                ("milestone", r"\bmilestones?\b"),
+                ("timelog", r"\btime\s*logs?\b|\btimesheets?\b|\btime\s*entries\b"),
+            ):
+                if re.search(pattern, query_text):
+                    requested_entity = candidate_entity
+                    break
+            if requested_entity and entity_type != requested_entity:
+                # A task filter must never accidentally render projects (or vice versa).
+                continue
+            filter_applies_to_entity = requested_entity == entity_type
+            if filter_applies_to_entity:
+                source_records = [record for record in records if isinstance(record, dict)]
+                field_values_present = any(
+                    _field_values_for_record(record, filter_spec["field"])
+                    for record in source_records
+                )
+                if source_records and not field_values_present:
+                    filter_error = (
+                        f"the {filter_spec['field']} field is not present in the returned "
+                        f"{entity_type} records, so I can't verify the filter"
+                    )
+                    records = []
+                else:
+                    records = [
+                        record for record in source_records
+                        if _record_matches_attribute_filter(record, filter_spec)
+                    ]
+
         # Avoid rendering the same tool/entity twice if the graph contains a
         # repeated tool message for the same entity type.
         if entity_type in seen_entities:
@@ -704,7 +1284,16 @@ def _safe_html_fallback(messages, user_message=""):
 
         total_count = None
         has_more = False
-        for source in metadata_sources:
+        # When this fallback itself applied a filter, original API totals describe
+        # the unfiltered collection and must not be reused as filtered counts.
+        if filter_applies_to_entity or person_filter_applies:
+            # The local filter ran against the complete records returned for this
+            # turn, so original API totals refer to the unfiltered set and cannot
+            # be reused for the filtered result.
+            raw_count = len(records)
+            total_count = raw_count
+            has_more = raw_count > 5
+        for source in (() if (filter_applies_to_entity or person_filter_applies) else metadata_sources):
             if not isinstance(source, dict):
                 continue
             # Support common total-count names used by task and project APIs.
@@ -733,16 +1322,47 @@ def _safe_html_fallback(messages, user_message=""):
             if total_count is not None:
                 break
 
-        dated = any(_record_date(record) for record in records)
-        ordered_records = sorted(records, key=_record_date, reverse=True) if dated else list(records)
+        if sort_spec:
+            sort_field, sort_reverse = sort_spec
+            valid_records = [record for record in records if isinstance(record, dict)]
+            present = [record for record in valid_records if _sort_value(record, sort_field)[0] == 0]
+            missing = [record for record in valid_records if _sort_value(record, sort_field)[0] != 0]
+            present.sort(key=lambda record: _sort_value(record, sort_field), reverse=sort_reverse)
+            ordered_records = present + missing
+        else:
+            dated = any(_record_date(record) for record in records)
+            ordered_records = sorted(records, key=_record_date, reverse=True) if dated else list(records)
         shown = ordered_records[:5]
 
         title = "time logs" if entity_type == "timelog" else route.replace("-", " ")
+        if filter_error:
+            chunks.append(f"<p>I couldn't apply the requested filter because {html.escape(filter_error)}.</p>")
+            continue
         if not shown:
-            chunks.append(f"<p>No matching {html.escape(title)} found.</p>")
+            if filter_applies_to_entity:
+                chunks.append(
+                    f"<p>No {html.escape(title)} matched "
+                    f"{html.escape(_FILTER_DISPLAY_LABELS.get(filter_spec['field'], filter_spec['field'].title()))}: "
+                    f"{html.escape(str(filter_spec['value']))}.</p>"
+                )
+            else:
+                chunks.append(f"<p>No matching {html.escape(title)} found.</p>")
             continue
 
-        chunks.append(f"<p>Here are the {html.escape(title)}:</p><ol>")
+        if person_filter_applies and requested_person and not filter_spec:
+            chunks.append(
+                f"<p>Here are the {html.escape(title)} assigned to "
+                f"{html.escape(requested_person.title())}:</p><ol>"
+            )
+        elif filter_spec:
+            filter_label = _FILTER_DISPLAY_LABELS.get(filter_spec["field"], filter_spec["field"].title())
+            filter_value = html.escape(str(filter_spec["value"]))
+            chunks.append(
+                f"<p>Here are the {html.escape(title)} with "
+                f"{html.escape(filter_label)}: {filter_value}:</p><ol>"
+            )
+        else:
+            chunks.append(f"<p>Here are the {html.escape(title)}:</p><ol>")
         for record in shown:
             name = next(
                 (record.get(key) for key in name_keys if record.get(key) not in (None, "")),
@@ -791,7 +1411,21 @@ def _safe_html_fallback(messages, user_message=""):
                     )
                 project_suffix = f" — Project: {safe_project_name}"
 
-            chunks.append(f"<li>{name_html}{suffix}{project_suffix}</li>")
+            requested_field_suffix = ""
+            display_field = filter_spec["field"] if filter_spec else (sort_spec[0] if sort_spec else None)
+            if display_field:
+                field_label = _FILTER_DISPLAY_LABELS.get(display_field, display_field.title())
+                actual_values = _field_values_for_record(record, display_field)
+                if not actual_values:
+                    # Sorting-only fields such as name/budget may be outside the filter aliases.
+                    raw_sort_value = _sort_value(record, display_field) if sort_spec else None
+                    actual_value = None if not raw_sort_value or raw_sort_value[0] != 0 else raw_sort_value[-1]
+                else:
+                    actual_value = _display_field_value(actual_values[0])
+                actual_text = html.escape(str(actual_value)) if actual_value not in (None, "") else "value unavailable"
+                requested_field_suffix = f" — {html.escape(field_label)}: {actual_text}"
+
+            chunks.append(f"<li>{name_html}{suffix}{project_suffix}{requested_field_suffix}</li>")
         chunks.append("</ol>")
 
         # Only claim more results when the API explicitly confirms them, or
@@ -893,6 +1527,7 @@ def _extract_requested_project(message: str, messages: list[dict] | None = None)
     patterns = (
         r"\b(?:inside|within|under|in)\s+(?:the\s+)?(?:project\s+)?(.+?)(?=\s+(?:with|where|whose|assigned|owned|having|and\s+with)\b|[?.!,;]|$)",
         r"\b(?:tasks?|issues?|milestones?)\s+(?:inside|within|under|in|of)\s+(?:the\s+)?(?:project\s+)?(.+?)(?=[?.!,;]|$)",
+        r"\b(?:status|progress|details?)\s+(?:of|for)\s+(?:the\s+)?(?:project\s+)?(.+?)(?=[?.!,;]|$)",
     )
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
@@ -976,7 +1611,7 @@ def _record_project_matches(record, requested_project: str) -> bool:
         return False
     for candidate in _record_project_names(record):
         actual = _canonical_project_text(candidate)
-        if actual and (actual == wanted or wanted in actual or actual in wanted):
+        if actual and actual == wanted:
             return True
     return False
 
@@ -1707,16 +2342,31 @@ async def tool_node(
                     state["access_token"],
                     arguments,
                 )
-            except Exception:
-                # Critical: a failed data request is not the same as a
-                # successful request that returned zero records. Re-raise so
-                # the API layer can report a failure instead of telling the
-                # user that no matching tasks/projects were found.
-                logger.exception(
-                    "Read tool execution failed (tool=%s)",
-                    tool_name,
-                )
-                raise
+            except Exception as exc:
+                # A timeout should not crash the entire chat endpoint with HTTP 500.
+                # Keep it distinct from an empty successful result so the renderer
+                # can tell the user retrieval failed and invite a retry.
+                exception_names = {
+                    cls.__name__.casefold()
+                    for cls in type(exc).__mro__
+                }
+                if any("timeout" in name for name in exception_names):
+                    logger.warning(
+                        "Read tool timed out (tool=%s, exception=%s)",
+                        tool_name,
+                        type(exc).__name__,
+                    )
+                    result = {
+                        "error": "The PMS request timed out before the records could be retrieved.",
+                        "error_code": "read_timeout",
+                        "tool": tool_name,
+                    }
+                else:
+                    logger.exception(
+                        "Read tool execution failed (tool=%s)",
+                        tool_name,
+                    )
+                    raise
 
             # Apply user/person filtering only AFTER the read tool has returned.
             # If the user asked for all records, leave the authorized result intact.
@@ -1738,8 +2388,6 @@ async def tool_node(
                                     names.append(value)
                         return any(
                             _canonical_project_text(name) == wanted
-                            or wanted in _canonical_project_text(name)
-                            or _canonical_project_text(name) in wanted
                             for name in names
                             if _canonical_project_text(name)
                         )
@@ -1900,9 +2548,37 @@ def route_after_tools(
     if state.get("final_response"):
         return "final"
 
-    # Always return tool results to the LLM.
-    # The LLM decides whether to analyze the result, answer the user,
-    # or call another available tool.
+    messages = state.get("messages", []) or []
+    current_user_message = next(
+        (
+            str(message.get("content") or "")
+            for message in reversed(messages)
+            if message.get("role") == "user"
+        ),
+        "",
+    )
+    current_user_index = max(
+        (i for i, message in enumerate(messages) if message.get("role") == "user"),
+        default=-1,
+    )
+    current_turn = messages[current_user_index + 1:] if current_user_index >= 0 else messages
+    has_read_result = any(
+        message.get("role") == "tool"
+        and (
+            message.get("name") in READ_TOOLS
+            or message.get("tool_name") in READ_TOOLS
+            or message.get("tool_call_id")
+        )
+        for message in current_turn
+    )
+
+    # List, filter, and sort results are rendered deterministically from the
+    # authorized tool payload in final_node. Skip a second LLM round-trip so a
+    # large result set (e.g. thousands of tasks) is not sent back into context.
+    if has_read_result and _is_simple_list_request(current_user_message):
+        return "final"
+
+    # Keep the existing LLM analysis/tool loop for non-list analytical questions.
     return "llm"
 
 
@@ -2398,9 +3074,223 @@ STRICT_FINAL_OUTPUT_CONTRACT = (
 # FINAL NODE
 # ============================================================
 
+
+
+# ============================================================
+# REQUESTED SORTING (APPLIED TO FRESH AUTHORIZED TOOL RESULTS)
+# ============================================================
+
+_SORT_FIELD_ALIASES = {
+    "priority": ("priority", "priority_name", "priorityName", "priority_label", "priorityLabel", "priority_value", "priorityValue", "priority_id", "priorityId"),
+    "status": ("status", "status_name", "statusName", "task_status", "taskStatus", "project_status", "projectStatus", "state", "state_name", "stateName"),
+    "due date": ("due_date", "dueDate", "deadline", "expected_end_date", "expectedEndDate", "end_date", "endDate", "target_date", "targetDate"),
+    "start date": ("start_date", "startDate", "planned_start_date", "plannedStartDate"),
+    "created date": ("created_at", "createdAt", "created_date", "createdDate"),
+    "updated date": ("updated_at", "updatedAt", "modified_at", "modifiedAt", "updated_date", "updatedDate"),
+    "completion": ("completion", "completion_percentage", "completionPercentage", "progress", "progress_percentage", "progressPercentage", "percent_complete", "percentComplete"),
+    "name": ("name", "title", "task_name", "taskName", "project_name", "projectName", "issue_name", "issueName", "milestone_name", "milestoneName"),
+    "budget": ("budget", "project_budget", "projectBudget", "estimated_cost", "estimatedCost", "cost"),
+    "owner": ("owner", "owner_name", "ownerName", "task_owner", "task_owner_name", "taskOwner", "taskOwnerName"),
+    "assignee": ("assignee", "assignees", "assignee_name", "assigneeName", "assigned_to", "assignedTo", "assigned_users", "assignedUsers"),
+}
+
+
+def _detect_sort_request(user_message: str):
+    """Detect an actual ordering request, not a request to filter by a value.
+
+    Examples:
+      - "sort tasks by priority high to low" -> priority descending by rank
+      - "order projects by name A to Z" -> name ascending
+      - "show tasks which have priority medium" -> not sorting; filtering handles it
+      - "sort tasks which are having priority as medium" -> filtering, despite the
+        colloquial use of the word "sort".
+    """
+    text = _normal_text(user_message)
+    if not text:
+        return None
+
+    # A field/value condition is filtering unless the user separately specifies
+    # an ordering field/direction (e.g. "medium-priority tasks, sorted by name").
+    value_filter_language = bool(re.search(
+        r"\b(?:which\s+(?:are\s+)?(?:having|have|has)|with|whose|having)\b.*"
+        r"\b(?:priority|status|state)\s*(?:is|as|=|equals?|equal\s+to)?\s*"
+        r"(?:critical|urgent|highest|high|medium|normal|low|lowest|open|active|"
+        r"in[\s_-]*progress|completed|closed|blocked|pending|overdue)\b",
+        text,
+    ))
+    explicit_ordering = bool(re.search(
+        r"\b(?:sort(?:ed|ing)?\s+by|order(?:ed)?\s+by|rank(?:ed|ing)?\s+by)\b",
+        text,
+    )) or bool(re.search(
+        r"\b(?:ascending|descending|\basc\b|\bdesc\b|high\s+to\s+low|"
+        r"low\s+to\s+high|highest\s+to\s+lowest|lowest\s+to\s+highest|"
+        r"a\s+to\s+z|z\s+to\s+a|earliest\s+first|latest\s+first|"
+        r"oldest\s+first|newest\s+first|smallest\s+to\s+largest|"
+        r"largest\s+to\s+smallest)\b",
+        text,
+    ))
+    if value_filter_language and not explicit_ordering:
+        return None
+
+    has_sort_trigger = bool(re.search(
+        r"\b(?:sort|sorts|sorted|sorting|order|ordered|rank|ranking)\b",
+        text,
+    )) or explicit_ordering
+    if not has_sort_trigger:
+        return None
+
+    field_patterns = (
+        ("due date", r"\b(?:due\s*date|deadline|due)\b"),
+        ("start date", r"\bstart\s*date\b"),
+        ("created date", r"\bcreated\s*date|creation\s*date\b"),
+        ("updated date", r"\bupdated\s*date|modified\s*date\b"),
+        ("priority", r"\bpriorit(?:y|ies)\b"),
+        ("status", r"\bstatus(?:es)?\b"),
+        ("completion", r"\b(?:completion|progress|percent(?:age)?\s*complete)\b"),
+        ("budget", r"\b(?:budget|cost)\b"),
+        ("owner", r"\bowner\b"),
+        ("assignee", r"\b(?:assignee|assigned\s+to)\b"),
+        ("name", r"\b(?:name|alphabetically|title)\b"),
+    )
+    field = next((name for name, pattern in field_patterns if re.search(pattern, text)), None)
+    if not field:
+        return None
+
+    ascending_words = bool(re.search(
+        r"\b(?:ascending|asc|lowest\s+to\s+highest|low\s+to\s+high|"
+        r"earliest\s+first|oldest\s+first|a\s+to\s+z|smallest\s+to\s+largest)\b",
+        text,
+    ))
+    descending_words = bool(re.search(
+        r"\b(?:descending|desc|highest\s+to\s+lowest|high\s+to\s+low|"
+        r"latest\s+first|newest\s+first|z\s+to\s+a|largest\s+to\s+smallest)\b",
+        text,
+    ))
+    if field == "priority":
+        # Priority rank order is High -> Medium -> Low by default.
+        reverse = ascending_words
+    elif field == "status":
+        reverse = descending_words
+    elif ascending_words:
+        reverse = False
+    elif descending_words:
+        reverse = True
+    else:
+        reverse = field in {"updated date", "created date"}
+    return field, reverse
+
+
+def _sort_value(record, field):
+    """Extract a sort value from direct or nested API fields, never parent-project values for task fields."""
+    aliases = _SORT_FIELD_ALIASES.get(field, ())
+    value = None
+
+    # Reuse the field extractor for common fields; it handles snake/camel case,
+    # nested display objects, and avoids reading a parent project's status/priority
+    # as though it were the task's own value.
+    if field in _FILTER_FIELD_ALIASES:
+        extracted = _field_values_for_record(record, field)
+        if extracted:
+            value = extracted[0]
+
+    # Other supported sort fields (e.g. name/budget) may not be filter fields.
+    if value in (None, "") and isinstance(record, dict):
+        normalized_aliases = {_normalize_field_name(alias) for alias in aliases}
+        def walk(obj, inside_project=False):
+            if isinstance(obj, dict):
+                for key, child in obj.items():
+                    norm = _normalize_field_name(key)
+                    is_project = inside_project or norm in {"project", "project_details", "project_record", "parent_project"}
+                    if norm in normalized_aliases and child not in (None, "") and not (field in {"priority", "status"} and is_project):
+                        return child
+                    if isinstance(child, (dict, list)):
+                        found = walk(child, is_project)
+                        if found not in (None, ""):
+                            return found
+            elif isinstance(obj, list):
+                for child in obj:
+                    found = walk(child, inside_project)
+                    if found not in (None, ""):
+                        return found
+            return None
+        value = walk(record)
+
+    value = _display_field_value(value) if value not in (None, "") else None
+    if value in (None, ""):
+        return (1, "")  # Missing values always sort last.
+
+    text = _normal_text(value)
+    compact = re.sub(r"[^a-z0-9]+", "", text)
+    if field == "priority":
+        ranks = {"urgent": 0, "critical": 0, "highest": 0, "high": 1, "medium": 2, "normal": 2, "low": 3, "lowest": 4}
+        return (0, ranks.get(compact, 99), compact)
+    if field == "status":
+        ranks = {"overdue": 0, "open": 1, "new": 1, "todo": 1, "inprogress": 2, "active": 2, "inreview": 3, "review": 3, "blocked": 4, "onhold": 5, "completed": 6, "complete": 6, "closed": 7, "done": 7, "cancelled": 8, "canceled": 8}
+        return (0, ranks.get(compact, 99), compact)
+    if field in {"due date", "start date", "created date", "updated date"}:
+        return (0, text[:10], text[11:])
+    if field in {"completion", "budget"}:
+        match = re.search(r"-?\d+(?:\.\d+)?", text.replace(",", ""))
+        return (0, float(match.group()) if match else float("inf"))
+    return (0, text)
+
+
+def _apply_requested_sort(messages, user_message: str):
+    """Sort every current-turn authorized tool payload by the requested field.
+
+    Sorting happens before the response's five-record presentation limit. This
+    only reorders records already returned by authorized PMS read tools.
+    """
+    sort_request = _detect_sort_request(user_message)
+    if not sort_request:
+        return messages, False
+    field, reverse = sort_request
+    sorted_messages = [dict(message) for message in messages]
+
+    for message in sorted_messages:
+        if message.get("role") != "tool":
+            continue
+        raw = message.get("content") or ""
+        try:
+            payload = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        records, parent, key = _extract_record_list(payload)
+        if records is None or not records:
+            continue
+        # Stable sort: records with no requested value are placed last even for
+        # descending sorts, rather than being promoted to the top.
+        present = [record for record in records if _sort_value(record, field)[0] == 0]
+        missing = [record for record in records if _sort_value(record, field)[0] != 0]
+        present.sort(key=lambda record: _sort_value(record, field), reverse=reverse)
+        sorted_records = present + missing
+        if parent is None:
+            payload = sorted_records
+        else:
+            parent[key] = sorted_records
+        message["content"] = json.dumps(payload, ensure_ascii=False, default=str)
+
+    logger.info("Applied requested PMS sort (field=%s, reverse=%s)", field, reverse)
+    return sorted_messages, True
+
+
 def _is_simple_list_request(user_message: str) -> bool:
     """Identify straightforward entity-list requests that should use deterministic HTML."""
     text = (user_message or "").strip().lower()
+    # Sorting requests for entity lists MUST use deterministic rendering too,
+    # so the renderer preserves the graph's order and prints the requested field.
+    if _detect_sort_request(text):
+        return bool(re.search(
+            r"\b(?:tasks?|projects?|issues?|defects?|milestones?|task\s*lists?|tasklists?|time\s*logs?|timesheets?)\b",
+            text,
+        ))
+    # Explicit field=value filters are deterministic list operations. They must
+    # be filtered in application code before the five-record limit is applied.
+    if _detect_attribute_filter(text) and re.search(
+        r"\b(?:tasks?|projects?|issues?|defects?|milestones?|task\s*lists?|tasklists?|time\s*logs?|timesheets?)\b",
+        text,
+    ):
+        return True
     # "My projects" / "what are my projects" should use the same deterministic
     # five-record + View More formatter even when the wording has no list verb.
     asks_to_list = bool(re.search(
@@ -2426,7 +3316,10 @@ def _is_simple_list_request(user_message: str) -> bool:
 def _deterministic_project_status_response(messages, user_message):
     """Answer a project-status follow-up from the filtered authorized project data."""
     text = _normal_text(user_message)
-    if not re.search(r"\bstatus\b", text) or not re.search(r"\bproject\b", text):
+    if not re.search(r"\bstatus\b", text):
+        return None
+    requested_project_for_status = _extract_requested_project(user_message, messages)
+    if not re.search(r"\bproject\b", text) and not requested_project_for_status:
         return None
 
     current_user_index = max(
@@ -2584,10 +3477,36 @@ async def final_node(
             user_message_index + 1:
         ]
 
-    # Status follow-ups are not list requests. If the graph has project data
-    # for this turn, answer with the selected project's actual status instead
-    # of returning the full project list.
-    if any(message.get("role") == "tool" for message in current_turn_messages):
+    # Apply explicit field=value filters to fresh authorized tool results before
+    # sorting, final LLM synthesis, and the five-record display limit.
+    attribute_filter = _detect_attribute_filter(user_message)
+    filter_applied = False
+    if current_turn_messages and attribute_filter:
+        messages, attribute_filter, filter_applied = _apply_attribute_filter_to_messages(
+            messages, user_message
+        )
+        # Refresh the current-turn slice because tool message payloads were replaced.
+        user_message_index = max(
+            (i for i, message in enumerate(messages) if message.get("role") == "user"),
+            default=-1,
+        )
+        current_turn_messages = messages[user_message_index + 1:] if user_message_index >= 0 else messages
+
+    # Apply explicit sorting to fresh authorized tool results before any
+    # final rendering or five-record display limit.
+    sort_applied = False
+    if current_turn_messages:
+        sorted_turn, sort_applied = _apply_requested_sort(current_turn_messages, user_message)
+        if sort_applied:
+            messages = messages[:user_message_index + 1] + sorted_turn
+            current_turn_messages = sorted_turn
+
+    # A list filter such as "tasks with status In Progress" must not be treated
+    # as a request for one project's status or passed into project-name matching.
+    if (
+        not attribute_filter
+        and any(message.get("role") == "tool" for message in current_turn_messages)
+    ):
         status_response = _deterministic_project_status_response(messages, user_message)
         if status_response:
             return {"final_response": status_response}
@@ -2623,6 +3542,21 @@ async def final_node(
             }
         )
 
+    if sort_applied:
+        sort_request = _detect_sort_request(user_message)
+        if sort_request:
+            sort_field, sort_reverse = sort_request
+            direction_label = "descending" if sort_reverse else "ascending"
+            final_messages.append({
+                "role": "system",
+                "content": (
+                    f"SORT REQUEST DISPLAY REQUIREMENT: The graph has already sorted the fresh authorized records by {sort_field} ({direction_label}). "
+                    f"Display the actual {sort_field} value next to EACH displayed record, in addition to its normal identifying fields. "
+                    "Do not omit the sort field value. Keep the graph-provided order exactly, and do not re-sort. "
+                    "If the value is absent in a record, label it 'value unavailable' rather than guessing."
+                ),
+            })
+
     if any(
         message.get(
             "role"
@@ -2635,14 +3569,14 @@ async def final_node(
                 "role": "system",
                 "content": (
                     "HARD TOOL RESULT PRESENTATION RULES — FOLLOW EXACTLY:\n"
-                    "1. TOOL DATA is the source of truth. Never invent, change, sort, merge, duplicate, or remove records unless the user explicitly requests an operation.\n"
+                    "1. TOOL DATA is the source of truth. Never invent, change, merge, duplicate, or remove records unless the user explicitly requests an operation. If the user requests sorting, use the graph-sorted fresh tool records in their given order; do not re-sort or guess values.\n"
                     "2. NEVER dump all available fields. For normal list/show/get requests use only the compact default fields:\n"
                     "PROJECT = name + public_id (or id) ONLY.\n"
                     "TASK = name + public_id (or id) + project ONLY.\n"
                     "ISSUE = name + public_id (or id) + project ONLY.\n"
                     "MILESTONE = name + public_id (or id) + project ONLY.\n"
                     "TASKLIST = name + public_id (or id) + project ONLY.\n"
-                    "3. Status, priority, completion, dates, owner, assignee, manager, delivery head, team, description, hours, billing, timestamps, and all other fields are FORBIDDEN by default. Add a field ONLY when the user explicitly asks for it.\n"
+                    "3. Status, priority, completion, dates, owner, assignee, manager, delivery head, team, description, hours, billing, timestamps, and all other fields are FORBIDDEN by default. Add a field ONLY when the user explicitly asks for it. IMPORTANT SORTING EXCEPTION: when the user asks to sort/order/rank by a field (for example priority, status, due date, start date, completion, budget, owner, assignee, or name), show that requested sort field's actual value beside EVERY displayed record, even if they did not separately say 'show the field'. Example: <li><a href=\"...\">Task name</a> (ID) — Priority: High</li>. For due-date sorting, show Due date: YYYY-MM-DD; for status sorting, show Status: In Progress. Use the exact value present in the tool record, support field-name aliases/nested display values, and never invent a missing value. If a record has no value for the sort field, show that the field is unavailable for that record.\n"
                     "4. For list requests, show at most the 5 most recent records (prefer updated_at/created_at/date descending; if no date exists, preserve TOOL DATA order). Use exactly one <ol> with one <li> per displayed record. If more than 5 records are available, append a View more link to the entity collection route (projects=/projects, tasks=/tasks, issues=/issues, milestones=/milestones, tasklists=/tasklists, time logs=/time-log). Do not state a total count or say 'showing 5 of N', because the returned count may not represent all records.\n"
                     "5. PRIMARY ENTITY NAVIGATION is mandatory whenever a reliable entity id exists. Use the graph-supplied navigation_url on the entity name.\n"
                     "6. For a task-list response, link only each task name to its own task navigation_url. Do not link project names or create project links from task records.\n"
@@ -2926,6 +3860,14 @@ def ensure_navigation_links(response_html, tool_data):
         from bs4 import BeautifulSoup, NavigableString
 
         soup = BeautifulSoup(response_html, "html.parser")
+
+        # Normalize malformed LLM HTML such as <a><strong><a>Task</a></strong></a>.
+        # Keep the innermost link and unwrap any ancestor anchor that contains it.
+        for inner_anchor in list(soup.find_all("a")):
+            ancestor_anchor = inner_anchor.find_parent("a")
+            if ancestor_anchor is not None:
+                ancestor_anchor.unwrap()
+
         # Prefer longer names first, so a shorter name contained in a longer
         # project/task name does not steal the match.
         entities.sort(key=lambda item: len(item[0]), reverse=True)
@@ -2934,21 +3876,23 @@ def ensure_navigation_links(response_html, tool_data):
             original = str(text_node)
             if not original.strip():
                 return
-            parent = text_node.parent
-            if parent and parent.name == "a":
+            # Text may be nested inside <strong>/<span> inside an existing link.
+            # Check all ancestors, not only the immediate parent, otherwise this
+            # pass can generate invalid nested <a> elements.
+            if text_node.find_parent("a"):
                 return
 
             matches = []
-            lower_original = original.casefold()
             for name, url in entities:
-                start = 0
-                needle = name.casefold()
-                while True:
-                    index = lower_original.find(needle, start)
-                    if index < 0:
-                        break
-                    matches.append((index, index + len(name), url))
-                    start = index + len(name)
+                # Escape literal entity names and require non-alphanumeric boundaries.
+                # This prevents a shorter name such as "test 1" from linking inside
+                # "test 12" or another longer identifier.
+                pattern = re.compile(
+                    r"(?<![A-Za-z0-9])" + re.escape(name) + r"(?![A-Za-z0-9])",
+                    re.IGNORECASE,
+                )
+                for found in pattern.finditer(original):
+                    matches.append((found.start(), found.end(), url))
 
             if not matches:
                 return
