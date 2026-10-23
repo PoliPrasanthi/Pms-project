@@ -447,7 +447,7 @@ def _normal_text(value):
     return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
 
 
-def _identity_matches(candidate, identities):
+def _identity_matches(candidate, identities, allow_fuzzy=True):
     """Match IDs exactly and person names by token or >=90% similarity.
 
     This supports a short query such as "Prasanthi" matching the stored full
@@ -491,11 +491,11 @@ def _identity_matches(candidate, identities):
         if re.search(rf"(?<![a-z0-9]){re.escape(identity_name)}(?![a-z0-9])", candidate_name):
             return True
 
-        # Allow a short/partial person name to match a longer stored display
-        # name, including common spelling variants such as "Prashanthi" vs
-        # "Prasanthi". Keep the fuzzy threshold conservative and require at
-        # least 5 characters for token-level fuzzy matching to avoid matching
-        # short, ambiguous names.
+        # Exact token/full-name matches always take precedence globally in
+        # the caller. Fuzzy matching is only a fallback when no exact person
+        # match exists in the result set.
+        if not allow_fuzzy:
+            continue
         if SequenceMatcher(None, candidate_name, identity_name).ratio() >= 0.82:
             return True
         identity_tokens = identity_name.split()
@@ -566,7 +566,7 @@ def _current_user_identity_values(user):
     return values
 
 
-def _record_assignment_matches(record, entity_type, identities, include_owner=False):
+def _record_assignment_matches(record, entity_type, identities, include_owner=False, allow_fuzzy=True):
     if not isinstance(record, dict) or not identities:
         return False
     common = {
@@ -621,13 +621,13 @@ def _record_assignment_matches(record, entity_type, identities, include_owner=Fa
             if isinstance(candidate, dict):
                 for k, v in candidate.items():
                     if _normalize_field_name(k) in {"id", "user_id", "name", "full_name", "username", "email", "first_name", "last_name"} and v is not None:
-                        if _identity_matches(v, identities):
+                        if _identity_matches(v, identities, allow_fuzzy=allow_fuzzy):
                             return True
                 first = candidate.get("first_name") or candidate.get("firstName")
                 last = candidate.get("last_name") or candidate.get("lastName")
-                if (first or last) and _identity_matches(f"{first or ''} {last or ''}", identities):
+                if (first or last) and _identity_matches(f"{first or ''} {last or ''}", identities, allow_fuzzy=allow_fuzzy):
                     return True
-            elif _identity_matches(candidate, identities):
+            elif _identity_matches(candidate, identities, allow_fuzzy=allow_fuzzy):
                 return True
     return False
 
@@ -1215,17 +1215,35 @@ def _safe_html_fallback(messages, user_message=""):
                 ))
                 include_owner = entity_type != "task" or explicit_owner_query
                 person_identities = {_normal_text(requested_person)}
-                records = [
+                # First search for exact full-name/token matches across ALL
+                # returned records. Only use fuzzy spelling matching if no
+                # exact match exists, preventing "Manikandan" from selecting
+                # a different person such as "Balaaji Manivaran" when an
+                # exact Manikandan record is present.
+                exact_records = [
                     record for record in records
                     if isinstance(record, dict) and _record_assignment_matches(
-                        record, entity_type, person_identities, include_owner=include_owner
+                        record, entity_type, person_identities,
+                        include_owner=include_owner, allow_fuzzy=False
                     )
                 ]
+                if exact_records:
+                    records = exact_records
+                    match_mode = "exact"
+                else:
+                    records = [
+                        record for record in records
+                        if isinstance(record, dict) and _record_assignment_matches(
+                            record, entity_type, person_identities,
+                            include_owner=include_owner, allow_fuzzy=True
+                        )
+                    ]
+                    match_mode = "fuzzy_fallback"
                 person_filter_applies = True
                 logger.info(
                     "Applied deterministic final named-person filter "
-                    "(entity=%s, person=%s, matched=%s)",
-                    entity_type, requested_person, len(records),
+                    "(entity=%s, person=%s, mode=%s, matched=%s)",
+                    entity_type, requested_person, match_mode, len(records),
                 )
 
         # DEFENSIVE FILTER: filter the records again at the final HTML boundary.
